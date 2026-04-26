@@ -19,7 +19,7 @@ TiDB のデータ移行ツール**として使えるようにすること。
 | `v0.1.0-baseline` | ✅ | TiDB monorepo から切り出した素の dumpling |
 | `v0.2.0-strip-consistency` | ✅ | consistency lock/flush 削除、テスト一掃 |
 | `v0.3.0-postgres` | ✅ | PG 用 catalog / driver / dialect、bin/pg-dumpling リネーム、Docker round-trip 成功 |
-| Phase 2(進行中) | 🚧 | **中間フォーマット**経由の PG → TiDB 移行: CSV ハードニング、テーブル内 chunk、`replace` 解消 |
+| `v0.4.0` | ✅ | Phase 2 完了: CSV server-side cast 21 型、テーブル内 chunk(数値 PK + ctid)、TiDB 内部依存 7→1、TiDB v8.5.6 への CSV 移行検証成功 |
 
 ## ビルド & テスト
 
@@ -138,20 +138,30 @@ Phase 1 末で完全削除:
 - `lockTablesBackoffer`、`getTableFromMySQLError`(retry.go)
 - `failpoint("SetIOTotalBytes")` フック
 
-## Phase 2 の作業項目
+## Phase 2 完了内容(v0.4.0)
 
-`worklog/04-phase2-roadmap.md` を主参照。要点は:
+- **CSV server-side cast**(`pgMigrationCast` in `sql.go`): 21 種の PG 型
+  (timestamptz / timestamp / time(tz) / date / interval / bool / bytea / uuid /
+  json / jsonb / inet / cidr / macaddr / 配列 / range / enum / pgvector / tsvector 等)
+  を `--filetype=csv` 時に MySQL/TiDB 互換の文字列に変換。SQL モードは PG ネイティブ literal を維持
+- **テーブル内 chunk 復活**: 数値 PK レンジ(`getNumericIndex`)→ `ctid` レンジ
+  (`concurrentDumpTableByCtid`)→ 単一 dump のフォールバック。`--rows N` で chunk 行数指定
+- **行数推定**: `pg_class.reltuples` ベースに置換(MySQL `EXPLAIN` パーサ撤去)
+- **TiDB 内部依存 7 → 1**:
+  - 削除: `br/pkg/version`、`pkg/util/promutil`、`br/pkg/utils.WithRetry`
+    (inline)、`br/pkg/summary`(zap log 化)、`pkg/util` の TLS(stdlib 化)
+  - vendor: `pkg/util/table-filter` を `internal/table-filter/` に
+  - 残置: `br/pkg/storage`(クラウドバックエンド一式は dumpling の魅力なので温存。
+    Phase 3 で public TiDB commit pin に切替予定)
 
-1. **CSV ハードニング** — PG 固有型(timestamptz / bytea / uuid / json /
-   配列 / range / enum / interval / inet 系)をサーバ側 cast で安全な文字列にして
-   出力。`--csv-binary-format`、bool の 0/1 化等のオプション追加
-2. **テーブル内 chunk** — 数値 PK レンジ → `ctid` レンジ → partition fan-out
-3. **`replace ~/Work/tidb` の解消** — 残った 5 パッケージを `internal/` 取り込み
-4. **ドキュメント整備と `v0.4.0` リリース**
+## Phase 3 候補
 
-CI(GitHub Actions)、Parquet 出力、PostGIS / hstore / tsvector の特殊型対応は
-Phase 3 以降へ送る。MySQL 互換 SQL 出力モード(`--target=mysql/tidb` フラグ)は
-**採用しない**。
+- **`replace ~/Work/tidb` の完全解消** — `require github.com/pingcap/tidb v0.0.0-<sha>` で公開リポジトリから引く
+- **CI**(GitHub Actions: build + PG smoke + TiDB smoke)
+- **Parquet 出力**(上流 dumpling にも無いので必要性次第)
+- **PostGIS / hstore / tsvector** などの特殊型対応
+
+MySQL 互換 SQL 出力モード(`--target=mysql/tidb` フラグ)は **採用しない**。
 
 ## 作業のお作法
 

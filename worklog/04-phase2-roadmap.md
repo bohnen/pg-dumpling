@@ -170,44 +170,28 @@ Phase 1 で `getNumericIndex` を空文字返却にした穴を塞ぐ。
 - `pkg/util`、`pkg/util/intest`、`pkg/util/logutil`、`pkg/util/prefetch`
 - `pkg/sessionctx/variable`、`pkg/lightning/log`
 
-これら全部を vendor すると行数が膨大になり「dump ツール」のリポジトリとしては不釣り合い。
-**選択肢**:
+**確定方針(2026-04-26)**: S3/GCS/Azure/HDFS/ks3 は dumpling の魅力の一つなので
+**温存**。Phase 2 では `replace ~/Work/tidb` を残し、Phase 3 で **public TiDB
+commit への pin**(`require github.com/pingcap/tidb v0.0.0-<sha>`)で `replace`
+を解消する。
 
-(a) **クラウドバックエンドを切り捨てる** — `--output /path/to/dir` のみサポート。
-    `local.go` + `compress.go` + `storage.go` の核だけ inline。S3/GCS/Azure/HDFS/ks3
-    はユーザ側で `aws s3 cp` 等の後段処理にしてもらう
-(b) **`replace` をしばらく残す** — 現状維持
-(c) **TiDB を public commit に pin** — `replace` を消す代わりに `require
-    github.com/pingcap/tidb v0.0.0-<sha>` で公開リポジトリから引く
+`go mod download` 時に TiDB ツリー全体が落ちてくる代わりに、build 後は linker が
+unused symbol を捨てるので `bin/pg-dumpling` のサイズに目立った影響は無い見込み。
 
-Phase 3 で (a) を有力候補として再検討する想定。Phase 2 では (b) を採用。
+vendor 案(transitive deps を `internal/` に全部取り込む)は storage の依存深度を
+考えると割に合わないので非採用。
+## 着手順序と完了状況
 
+1. ✅ **04a — CSV ハードニング**(commit `030e7c4`): `pgMigrationCast` で 21 種の
+   PG 型に SELECT 句 cast。Round-trip 検証成功(MySQL / TiDB 両方)
+2. ✅ **04b — テーブル内 chunk 復活**(commit `dcad158`): `getNumericIndex` 復活、
+   `concurrentDumpTableByCtid` 新設、`pg_class.reltuples` 行数推定に切替
+3. ✅ **04c — TiDB 内部依存削減**(commits `7035f3f` + `42dd13a`): 7 → 1 パッケージ
+   に縮小。`replace ~/Work/tidb` 自体は `br/pkg/storage` のために Phase 3 まで残置
+4. 🔧 **04d — ドキュメント整備とリリース**: 本コミット。`v0.4.0` タグを打つ
 
-
-`go.mod` から `replace github.com/pingcap/tidb => ...` を消すには現在依存している
-以下を `internal/` に取り込むか書き直す:
-
-| 依存 | 用途 | 取り込み方針 |
-|---|---|---|
-| `br/pkg/storage` | S3/GCS/Azure 抽象 | そのままコピー(Apache 2.0) |
-| `br/pkg/utils` | retry helper | `WithRetry` 1 関数のみ自前実装で代替 |
-| `br/pkg/summary` | progress 集計 | コピー or zap log 化で簡素化 |
-| `pkg/util/table-filter` | `--filter` 解析 | コピー(独立性高) |
-| `pkg/util/promutil` | metrics ファクトリ | コピー(数行) |
-| `pkg/util` | `SliceKeysQuoted` 等 | 必要関数のみ inline |
-
-これで完全独立モジュールになり、外部に push 可能になる。
-
-## 着手順序
-
-1. **04a — CSV ハードニング**: 型ごとの SELECT 句 cast、`--csv-binary-format`
-   等のオプション、テストデータでの round-trip 確認
-2. **04b — テーブル内 chunk 復活**: 数値 PK → ctid → partition fan-out
-3. **04c — TiDB 依存解消**: `replace` 削除、`internal/` 取り込み、`go mod tidy`
-4. **04d — ドキュメント整備とリリース**: 移行ガイド、型マトリクス、`v0.4.0` タグ
-
-CI(GitHub Actions)、Parquet 出力、PostGIS / hstore / tsvector の特殊型対応は
-Phase 3 以降へ送る。
+CI(GitHub Actions)、`replace` 完全解消、Parquet 出力、PostGIS / hstore / tsvector
+の特殊型対応は Phase 3 以降。
 
 ## 移行先(TiDB 側)で利用者が手当てする項目
 

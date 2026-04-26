@@ -17,14 +17,15 @@ Status
   binary connects via `pgx`, queries `pg_catalog`, snapshots via
   `pg_export_snapshot()`, shells out to `pg_dump --schema-only` for DDL,
   and writes per-table data files in dumpling's chunked layout.
-- **Phase 2** (in progress) — PG → MySQL/TiDB migration via CSV.
-  Hardening of the CSV path so that PG-specific types (timestamptz,
-  bytea, uuid, jsonb, arrays, ranges, enum, interval, inet) are
-  emitted in a form TiDB Lightning can ingest, plus revival of
-  table-internal chunking and removal of the local TiDB `replace`
-  directive. Direct MySQL-loadable SQL output is **not** pursued —
-  the PG/MySQL incompatibility surface is too wide for SQL-level
-  translation. See `worklog/04-phase2-roadmap.md`.
+- **Phase 2** (`v0.4.0`) — PG → MySQL/TiDB migration via CSV. Server-
+  side casts in CSV mode emit PG-specific types (timestamptz, bytea,
+  uuid, jsonb, arrays, ranges, enum, interval, inet) in a form TiDB
+  Lightning / `LOAD DATA LOCAL INFILE` can ingest. Table-internal
+  chunking restored (numeric PK range + ctid fallback). TiDB-internal
+  imports trimmed from 7 to 1; only `br/pkg/storage` (cloud backend
+  layer) still requires the local TiDB checkout via the go.mod
+  `replace`. Verified end-to-end against `postgres:17` ↔
+  `tidb:v8.5.6` and `mysql:8.4`. See `worklog/04-phase2-roadmap.md`.
 
 What gets dumped
 ----------------
