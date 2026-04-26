@@ -1,9 +1,17 @@
-# 02 — MySQL/TiDB strip: 第 1 段(consistency lock/flush 廃止)
+# 02 — MySQL/TiDB strip(連続コミット 02a / 02b / 02c)
 
 - 日付: 2026-04-26
 - 担当: tadatoshi.sekiguchi@pingcap.com (with Claude)
-- 状態: ✅ build 通過(consistency 周りの strip 完了)
-- 残タスク: TiDB region chunking、`tidbSetPDClientForGC` 等の TiDB-only step、ServerInfo 由来の分岐、MySQL 用 SQL クエリ、`go-sql-driver/mysql` 依存
+- 状態: ✅ build 通過。export/ は 12,500 → 6,067 行に縮小(51% 削減)
+- 残タスク(Step 03 で対応): driver 入れ替え、PG 用クエリ書き直し、出力方言、型 map、`pg_dump` shell-out、`bin/pg-dumpling` 改名
+
+## コミットの並び
+
+| commit | tag | 内容 |
+|---|---|---|
+| `589db59` | `v0.2.0-strip-consistency` | テスト/docs/install.sh/region_results.csv 削除、`consistency.go` 全面書き直し、dump.go の lock/flush 分岐除去 |
+| `b7dcdbe` | (なし) | dump.go から TiKV region chunking / TiDB init step を一括削除(1710 → 980 行) |
+| `80f595d` | (なし) | sql.go の TiDB/MySQL-only 関数 22 個削除、metadata.go の binlog/GTID 処理を no-op 化、util.go の etcd 連携削除 |
 
 ## ゴール
 
