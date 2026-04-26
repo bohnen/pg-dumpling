@@ -3,17 +3,12 @@
 package export
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"database/sql/driver"
-	"encoding/hex"
 	"fmt"
 	"math/big"
 	"net"
-	"slices"
-	"strconv"
-	"strings"
 	"sync/atomic"
 	"time"
 
@@ -27,18 +22,10 @@ import (
 	"github.com/pingcap/tidb/br/pkg/storage"
 	"github.com/pingcap/tidb/br/pkg/summary"
 	"github.com/pingcap/tidb/br/pkg/version"
+	"github.com/pingcap/tidb/pkg/util"
 	"github.com/tadapin/pg-dumpling/cli"
 	tcontext "github.com/tadapin/pg-dumpling/context"
 	"github.com/tadapin/pg-dumpling/log"
-	infoschema "github.com/pingcap/tidb/pkg/infoschema/context"
-	"github.com/pingcap/tidb/pkg/parser"
-	"github.com/pingcap/tidb/pkg/parser/ast"
-	"github.com/pingcap/tidb/pkg/parser/format"
-	"github.com/pingcap/tidb/pkg/store/helper"
-	"github.com/pingcap/tidb/pkg/tablecodec"
-	"github.com/pingcap/tidb/pkg/util"
-	"github.com/pingcap/tidb/pkg/util/codec"
-	pd "github.com/tikv/pd/client"
 	gatomic "go.uber.org/atomic"
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
@@ -62,8 +49,6 @@ type Dumper struct {
 	extStore storage.ExternalStorage
 	dbHandle *sql.DB
 
-	tidbPDClientForGC             pd.Client
-	selectTiDBTableRegionFunc     func(tctx *tcontext.Context, conn *BaseConn, meta TableMeta) (pkFields []string, pkVals [][]string, err error)
 	totalTables                   int64
 	charsetAndDefaultCollationMap map[string]string
 
@@ -87,11 +72,10 @@ func NewDumper(ctx context.Context, conf *Config) (*Dumper, error) {
 
 	tctx, cancelFn := tcontext.Background().WithContext(ctx).WithCancel()
 	d := &Dumper{
-		tctx:                      tctx,
-		conf:                      conf,
-		cancelCtx:                 cancelFn,
-		selectTiDBTableRegionFunc: selectTiDBTableRegion,
-		speedRecorder:             NewSpeedRecorder(),
+		tctx:          tctx,
+		conf:          conf,
+		cancelCtx:     cancelFn,
+		speedRecorder: NewSpeedRecorder(),
 	}
 
 	var err error
@@ -127,14 +111,8 @@ func NewDumper(ctx context.Context, conf *Config) (*Dumper, error) {
 		createExternalStore,
 		startHTTPService,
 		openSQLDB,
-		detectServerInfo,
 		resolveAutoConsistency,
-
 		validateResolveAutoConsistency,
-		tidbSetPDClientForGC,
-		tidbGetSnapshot,
-		tidbStartGCSavepointUpdateService,
-
 		setSessionParam)
 	return d, err
 }
@@ -189,14 +167,6 @@ func (d *Dumper) Dump() (dumpErr error) {
 	err = m.recordGlobalMetaData(metaConn, conf.ServerInfo, false)
 	if err != nil {
 		tctx.L().Warn("get global metadata failed", log.ShortError(err))
-	}
-
-	if d.conf.CollationCompatible == StrictCollationCompatible {
-		//init charset and default collation map
-		d.charsetAndDefaultCollationMap, err = GetCharsetAndDefaultCollation(tctx.Context, metaConn)
-		if err != nil {
-			return err
-		}
 	}
 
 	if err = prepareTableListToDump(tctx, conf, metaConn); err != nil {
@@ -394,16 +364,9 @@ func (d *Dumper) dumpDatabases(tctx *tcontext.Context, metaConn *BaseConn, taskC
 		}
 	}
 
-	parser1 := parser.New()
 	for dbName, tables := range allTables {
 		if !conf.NoSchemas {
 			createDatabaseSQL, err := ShowCreateDatabase(tctx, metaConn, dbName)
-			if err != nil {
-				return errors.Trace(err)
-			}
-
-			// adjust db collation
-			createDatabaseSQL, err = adjustDatabaseCollation(tctx, d.conf.CollationCompatible, parser1, createDatabaseSQL, d.charsetAndDefaultCollationMap)
 			if err != nil {
 				return errors.Trace(err)
 			}
@@ -438,13 +401,6 @@ func (d *Dumper) dumpDatabases(tctx *tcontext.Context, metaConn *BaseConn, taskC
 						return tctx.Err()
 					}
 				default:
-					// adjust table collation
-					newCreateSQL, err := adjustTableCollation(tctx, d.conf.CollationCompatible, parser1, meta.ShowCreateTable(), d.charsetAndDefaultCollationMap)
-					if err != nil {
-						return errors.Trace(err)
-					}
-					meta.(*tableMeta).showCreateTable = newCreateSQL
-
 					task := NewTaskTableMeta(dbName, table.Name, meta.ShowCreateTable())
 					ctxDone := d.sendTaskToChan(tctx, task, taskChan)
 					if ctxDone {
@@ -463,130 +419,6 @@ func (d *Dumper) dumpDatabases(tctx *tcontext.Context, metaConn *BaseConn, taskC
 	return nil
 }
 
-// adjustDatabaseCollation adjusts db collation and return new create sql and collation
-func adjustDatabaseCollation(tctx *tcontext.Context, collationCompatible string, parser *parser.Parser, originSQL string, charsetAndDefaultCollationMap map[string]string) (string, error) {
-	if collationCompatible != StrictCollationCompatible {
-		return originSQL, nil
-	}
-	stmt, err := parser.ParseOneStmt(originSQL, "", "")
-	if err != nil {
-		tctx.L().Warn("parse create database error, maybe tidb parser doesn't support it", zap.String("originSQL", originSQL), log.ShortError(err))
-		return originSQL, nil
-	}
-	createStmt, ok := stmt.(*ast.CreateDatabaseStmt)
-	if !ok {
-		return originSQL, nil
-	}
-	var charset string
-	for _, createOption := range createStmt.Options {
-		// already have 'Collation'
-		if createOption.Tp == ast.DatabaseOptionCollate {
-			return originSQL, nil
-		}
-		if createOption.Tp == ast.DatabaseOptionCharset {
-			charset = createOption.Value
-		}
-	}
-	// get db collation
-	collation, ok := charsetAndDefaultCollationMap[strings.ToLower(charset)]
-	if !ok {
-		tctx.L().Warn("not found database charset default collation.", zap.String("originSQL", originSQL), zap.String("charset", strings.ToLower(charset)))
-		return originSQL, nil
-	}
-	// add collation
-	createStmt.Options = append(createStmt.Options, &ast.DatabaseOption{Tp: ast.DatabaseOptionCollate, Value: collation})
-	// rewrite sql
-	var b []byte
-	bf := bytes.NewBuffer(b)
-	err = createStmt.Restore(&format.RestoreCtx{
-		Flags: format.DefaultRestoreFlags | format.RestoreTiDBSpecialComment,
-		In:    bf,
-	})
-	if err != nil {
-		return "", errors.Trace(err)
-	}
-	return bf.String(), nil
-}
-
-// adjustTableCollation adjusts table collation
-func adjustTableCollation(tctx *tcontext.Context, collationCompatible string, parser *parser.Parser, originSQL string, charsetAndDefaultCollationMap map[string]string) (string, error) {
-	if collationCompatible != StrictCollationCompatible {
-		return originSQL, nil
-	}
-	stmt, err := parser.ParseOneStmt(originSQL, "", "")
-	if err != nil {
-		tctx.L().Warn("parse create table error, maybe tidb parser doesn't support it", zap.String("originSQL", originSQL), log.ShortError(err))
-		return originSQL, nil
-	}
-	createStmt, ok := stmt.(*ast.CreateTableStmt)
-	if !ok {
-		return originSQL, nil
-	}
-	var charset string
-	var collation string
-	for _, createOption := range createStmt.Options {
-		// already have 'Collation'
-		if createOption.Tp == ast.TableOptionCollate {
-			collation = createOption.StrValue
-			break
-		}
-		if createOption.Tp == ast.TableOptionCharset {
-			charset = createOption.StrValue
-		}
-	}
-
-	if collation == "" && charset != "" {
-		collation, ok := charsetAndDefaultCollationMap[strings.ToLower(charset)]
-		if !ok {
-			tctx.L().Warn("not found table charset default collation.", zap.String("originSQL", originSQL), zap.String("charset", strings.ToLower(charset)))
-			return originSQL, nil
-		}
-
-		// add collation
-		createStmt.Options = append(createStmt.Options, &ast.TableOption{Tp: ast.TableOptionCollate, StrValue: collation})
-	}
-
-	// adjust columns collation
-	adjustColumnsCollation(tctx, createStmt, charsetAndDefaultCollationMap)
-
-	// rewrite sql
-	var b []byte
-	bf := bytes.NewBuffer(b)
-	err = createStmt.Restore(&format.RestoreCtx{
-		Flags: format.DefaultRestoreFlags | format.RestoreTiDBSpecialComment,
-		In:    bf,
-	})
-	if err != nil {
-		return "", errors.Trace(err)
-	}
-	return bf.String(), nil
-}
-
-// adjustColumnsCollation adds column's collation.
-func adjustColumnsCollation(tctx *tcontext.Context, createStmt *ast.CreateTableStmt, charsetAndDefaultCollationMap map[string]string) {
-ColumnLoop:
-	for _, col := range createStmt.Cols {
-		for _, options := range col.Options {
-			// already have 'Collation'
-			if options.Tp == ast.ColumnOptionCollate {
-				continue ColumnLoop
-			}
-		}
-		fieldType := col.Tp
-		if fieldType.GetCollate() != "" {
-			continue
-		}
-		if fieldType.GetCharset() != "" {
-			// just have charset
-			collation, ok := charsetAndDefaultCollationMap[strings.ToLower(fieldType.GetCharset())]
-			if !ok {
-				tctx.L().Warn("not found charset default collation for column.", zap.String("table", createStmt.Table.Name.String()), zap.String("column", col.Name.String()), zap.String("charset", strings.ToLower(fieldType.GetCharset())))
-				continue
-			}
-			fieldType.SetCollate(collation)
-		}
-	}
-}
 
 func (d *Dumper) dumpTableData(tctx *tcontext.Context, conn *BaseConn, meta TableMeta, taskChan chan<- Task) error {
 	conf := d.conf
@@ -708,20 +540,6 @@ func (d *Dumper) sequentialDumpTable(tctx *tcontext.Context, conn *BaseConn, met
 func (d *Dumper) concurrentDumpTable(tctx *tcontext.Context, conn *BaseConn, meta TableMeta, taskChan chan<- Task) error {
 	conf := d.conf
 	db, tbl := meta.DatabaseName(), meta.TableName()
-	if conf.ServerInfo.ServerType == version.ServerTypeTiDB &&
-		conf.ServerInfo.ServerVersion != nil &&
-		(conf.ServerInfo.ServerVersion.Compare(*tableSampleVersion) >= 0 ||
-			(conf.ServerInfo.HasTiKV && conf.ServerInfo.ServerVersion.Compare(*decodeRegionVersion) >= 0)) {
-		err := d.concurrentDumpTiDBTables(tctx, conn, meta, taskChan)
-		// don't retry on context error and successful tasks
-		if err2 := errors.Cause(err); err2 == nil || err2 == context.DeadlineExceeded || err2 == context.Canceled {
-			return err
-		} else if err2 != errEmptyHandleVals {
-			tctx.L().Info("fallback to concurrent dump tables using rows due to some problem. This won't influence the whole dump process",
-				zap.String("database", db), zap.String("table", tbl), log.ShortError(err))
-		}
-	}
-
 	orderByClause, err := buildOrderByClause(tctx, conf, conn, db, tbl, meta.HasImplicitRowID())
 	if err != nil {
 		return err
@@ -843,270 +661,9 @@ func (d *Dumper) selectMinAndMaxIntValue(tctx *tcontext.Context, conn *BaseConn,
 	return minv, maxv, nil
 }
 
-func (d *Dumper) concurrentDumpTiDBTables(tctx *tcontext.Context, conn *BaseConn, meta TableMeta, taskChan chan<- Task) error {
-	db, tbl := meta.DatabaseName(), meta.TableName()
-
-	var (
-		handleColNames []string
-		handleVals     [][]string
-		err            error
-	)
-	// for TiDB v5.0+, we can use table sample directly
-	if d.conf.ServerInfo.ServerVersion.Compare(*tableSampleVersion) >= 0 {
-		tctx.L().Debug("dumping TiDB tables with TABLESAMPLE",
-			zap.String("database", db), zap.String("table", tbl))
-		handleColNames, handleVals, err = selectTiDBTableSample(tctx, conn, meta)
-	} else {
-		// for TiDB v3.0+, we can use table region decode in TiDB directly
-		tctx.L().Debug("dumping TiDB tables with TABLE REGIONS",
-			zap.String("database", db), zap.String("table", tbl))
-		var partitions []string
-		if d.conf.ServerInfo.ServerVersion.Compare(*gcSafePointVersion) >= 0 {
-			partitions, err = GetPartitionNames(tctx, conn, db, tbl)
-		}
-		if err == nil {
-			if len(partitions) != 0 {
-				return d.concurrentDumpTiDBPartitionTables(tctx, conn, meta, taskChan, partitions)
-			}
-			handleColNames, handleVals, err = d.selectTiDBTableRegionFunc(tctx, conn, meta)
-		}
-	}
-	if err != nil {
-		return err
-	}
-	return d.sendConcurrentDumpTiDBTasks(tctx, meta, taskChan, handleColNames, handleVals, "", 0, len(handleVals)+1)
-}
-
-func (d *Dumper) concurrentDumpTiDBPartitionTables(tctx *tcontext.Context, conn *BaseConn, meta TableMeta, taskChan chan<- Task, partitions []string) error {
-	db, tbl := meta.DatabaseName(), meta.TableName()
-	tctx.L().Debug("dumping TiDB tables with TABLE REGIONS for partition table",
-		zap.String("database", db), zap.String("table", tbl), zap.Strings("partitions", partitions))
-
-	startChunkIdx := 0
-	totalChunk := 0
-	cachedHandleVals := make([][][]string, len(partitions))
-
-	handleColNames, _, err := selectTiDBRowKeyFields(tctx, conn, meta, checkTiDBTableRegionPkFields)
-	if err != nil {
-		return err
-	}
-	// cache handleVals here to calculate the total chunks
-	for i, partition := range partitions {
-		handleVals, err := selectTiDBPartitionRegion(tctx, conn, db, tbl, partition)
-		if err != nil {
-			return err
-		}
-		totalChunk += len(handleVals) + 1
-		cachedHandleVals[i] = handleVals
-	}
-	for i, partition := range partitions {
-		err := d.sendConcurrentDumpTiDBTasks(tctx, meta, taskChan, handleColNames, cachedHandleVals[i], partition, startChunkIdx, totalChunk)
-		if err != nil {
-			return err
-		}
-		startChunkIdx += len(cachedHandleVals[i]) + 1
-	}
-	return nil
-}
-
-func (d *Dumper) sendConcurrentDumpTiDBTasks(tctx *tcontext.Context,
-	meta TableMeta, taskChan chan<- Task,
-	handleColNames []string, handleVals [][]string, partition string,
-	startChunkIdx, totalChunk int) error {
-	db, tbl := meta.DatabaseName(), meta.TableName()
-	if len(handleVals) == 0 {
-		if partition == "" {
-			// return error to make outside function try using rows method to dump data
-			return errors.Annotatef(errEmptyHandleVals, "table: `%s`.`%s`", escapeString(db), escapeString(tbl))
-		}
-		return d.dumpWholeTableDirectly(tctx, meta, taskChan, partition, buildOrderByClauseString(handleColNames), startChunkIdx, totalChunk)
-	}
-	conf := d.conf
-	selectField, selectLen := meta.SelectedField(), meta.SelectedLen()
-	where := buildWhereClauses(handleColNames, handleVals)
-	orderByClause := buildOrderByClauseString(handleColNames)
-
-	for i, w := range where {
-		query := buildSelectQuery(db, tbl, selectField, partition, buildWhereCondition(conf, w), orderByClause)
-		task := d.newTaskTableData(meta, newTableData(query, selectLen, false), i+startChunkIdx, totalChunk)
-		ctxDone := d.sendTaskToChan(tctx, task, taskChan)
-		if ctxDone {
-			return tctx.Err()
-		}
-	}
-	return nil
-}
-
 // L returns real logger
 func (d *Dumper) L() log.Logger {
 	return d.tctx.L()
-}
-
-func selectTiDBTableSample(tctx *tcontext.Context, conn *BaseConn, meta TableMeta) (pkFields []string, pkVals [][]string, err error) {
-	pkFields, pkColTypes, err := selectTiDBRowKeyFields(tctx, conn, meta, nil)
-	if err != nil {
-		return nil, nil, errors.Trace(err)
-	}
-
-	query := buildTiDBTableSampleQuery(pkFields, meta.DatabaseName(), meta.TableName())
-	pkValNum := len(pkFields)
-	var iter SQLRowIter
-	rowRec := MakeRowReceiver(pkColTypes)
-	buf := new(bytes.Buffer)
-
-	err = conn.QuerySQL(tctx, func(rows *sql.Rows) error {
-		if iter == nil {
-			iter = &rowIter{
-				rows: rows,
-				args: make([]any, pkValNum),
-			}
-		}
-		err = iter.Decode(rowRec)
-		if err != nil {
-			return errors.Trace(err)
-		}
-		pkValRow := make([]string, 0, pkValNum)
-		for _, rec := range rowRec.receivers {
-			rec.WriteToBuffer(buf, true)
-			pkValRow = append(pkValRow, buf.String())
-			buf.Reset()
-		}
-		pkVals = append(pkVals, pkValRow)
-		return nil
-	}, func() {
-		if iter != nil {
-			_ = iter.Close()
-			iter = nil
-		}
-		rowRec = MakeRowReceiver(pkColTypes)
-		pkVals = pkVals[:0]
-		buf.Reset()
-	}, query)
-	if err == nil && iter != nil && iter.Error() != nil {
-		err = iter.Error()
-	}
-
-	return pkFields, pkVals, err
-}
-
-func buildTiDBTableSampleQuery(pkFields []string, dbName, tblName string) string {
-	template := "SELECT %s FROM `%s`.`%s` TABLESAMPLE REGIONS() ORDER BY %s"
-	quotaPk := make([]string, len(pkFields))
-	for i, s := range pkFields {
-		quotaPk[i] = fmt.Sprintf("`%s`", escapeString(s))
-	}
-	pks := strings.Join(quotaPk, ",")
-	return fmt.Sprintf(template, pks, escapeString(dbName), escapeString(tblName), pks)
-}
-
-func selectTiDBRowKeyFields(tctx *tcontext.Context, conn *BaseConn, meta TableMeta, checkPkFields func([]string, []string) error) (pkFields, pkColTypes []string, err error) {
-	if meta.HasImplicitRowID() {
-		pkFields, pkColTypes = []string{"_tidb_rowid"}, []string{"BIGINT"}
-	} else {
-		pkFields, pkColTypes, err = GetPrimaryKeyAndColumnTypes(tctx, conn, meta)
-		if err == nil {
-			if checkPkFields != nil {
-				err = checkPkFields(pkFields, pkColTypes)
-			}
-		}
-	}
-	return
-}
-
-func checkTiDBTableRegionPkFields(pkFields, pkColTypes []string) (err error) {
-	if len(pkFields) != 1 || len(pkColTypes) != 1 {
-		err = errors.Errorf("unsupported primary key for selectTableRegion. pkFields: [%s], pkColTypes: [%s]", strings.Join(pkFields, ", "), strings.Join(pkColTypes, ", "))
-		return
-	}
-	if _, ok := dataTypeInt[pkColTypes[0]]; !ok {
-		err = errors.Errorf("unsupported primary key type for selectTableRegion. pkFields: [%s], pkColTypes: [%s]", strings.Join(pkFields, ", "), strings.Join(pkColTypes, ", "))
-	}
-	return
-}
-
-func selectTiDBTableRegion(tctx *tcontext.Context, conn *BaseConn, meta TableMeta) (pkFields []string, pkVals [][]string, err error) {
-	pkFields, _, err = selectTiDBRowKeyFields(tctx, conn, meta, checkTiDBTableRegionPkFields)
-	if err != nil {
-		return
-	}
-
-	var (
-		startKey, decodedKey sql.NullString
-		rowID                = -1
-	)
-	const (
-		tableRegionSQL = "SELECT START_KEY,tidb_decode_key(START_KEY) from INFORMATION_SCHEMA.TIKV_REGION_STATUS s WHERE s.DB_NAME = ? AND s.TABLE_NAME = ? AND IS_INDEX = 0 ORDER BY START_KEY;"
-		tidbRowID      = "_tidb_rowid="
-	)
-	dbName, tableName := meta.DatabaseName(), meta.TableName()
-	logger := tctx.L().With(zap.String("database", dbName), zap.String("table", tableName))
-	err = conn.QuerySQL(tctx, func(rows *sql.Rows) error {
-		rowID++
-		err = rows.Scan(&startKey, &decodedKey)
-		if err != nil {
-			return errors.Trace(err)
-		}
-		// first region's start key has no use. It may come from another table or might be invalid
-		if rowID == 0 {
-			return nil
-		}
-		if !startKey.Valid {
-			logger.Debug("meet invalid start key", zap.Int("rowID", rowID))
-			return nil
-		}
-		if !decodedKey.Valid {
-			logger.Debug("meet invalid decoded start key", zap.Int("rowID", rowID), zap.String("startKey", startKey.String))
-			return nil
-		}
-		pkVal, err2 := extractTiDBRowIDFromDecodedKey(tidbRowID, decodedKey.String)
-		if err2 != nil {
-			logger.Debug("cannot extract pkVal from decoded start key",
-				zap.Int("rowID", rowID), zap.String("startKey", startKey.String), zap.String("decodedKey", decodedKey.String), log.ShortError(err2))
-		} else {
-			pkVals = append(pkVals, []string{pkVal})
-		}
-		return nil
-	}, func() {
-		pkFields = pkFields[:0]
-		pkVals = pkVals[:0]
-	}, tableRegionSQL, dbName, tableName)
-
-	return pkFields, pkVals, errors.Trace(err)
-}
-
-func selectTiDBPartitionRegion(tctx *tcontext.Context, conn *BaseConn, dbName, tableName, partition string) (pkVals [][]string, err error) {
-	var startKeys [][]string
-	const (
-		partitionRegionSQL = "SHOW TABLE `%s`.`%s` PARTITION(`%s`) REGIONS"
-		regionRowKey       = "r_"
-	)
-	logger := tctx.L().With(zap.String("database", dbName), zap.String("table", tableName), zap.String("partition", partition))
-	startKeys, err = conn.QuerySQLWithColumns(tctx, []string{"START_KEY"}, fmt.Sprintf(partitionRegionSQL, escapeString(dbName), escapeString(tableName), escapeString(partition)))
-	if err != nil {
-		return
-	}
-	for rowID, startKey := range startKeys {
-		if rowID == 0 || len(startKey) != 1 {
-			continue
-		}
-		pkVal, err2 := extractTiDBRowIDFromDecodedKey(regionRowKey, startKey[0])
-		if err2 != nil {
-			logger.Debug("show table region start key doesn't have rowID",
-				zap.Int("rowID", rowID), zap.String("startKey", startKey[0]), zap.Error(err2))
-		} else {
-			pkVals = append(pkVals, []string{pkVal})
-		}
-	}
-
-	return pkVals, nil
-}
-
-func extractTiDBRowIDFromDecodedKey(indexField, key string) (string, error) {
-	if p := strings.Index(key, indexField); p != -1 {
-		p += len(indexField)
-		return key[p:], nil
-	}
-	return "", errors.Errorf("decoded key %s doesn't have %s field", key, indexField)
 }
 
 func getListTableTypeByConf(conf *Config) listTableType {
@@ -1349,19 +906,6 @@ func openSQLDB(d *Dumper) error {
 	return nil
 }
 
-// detectServerInfo is an initialization step of Dumper.
-func detectServerInfo(d *Dumper) error {
-	db, conf := d.dbHandle, d.conf
-	versionStr, err := version.FetchVersion(d.tctx.Context, db)
-	if err != nil {
-		conf.ServerInfo = ServerInfoUnknown
-		return err
-	}
-	conf.ServerInfo = version.ParseServerInfo(versionStr)
-	return nil
-}
-
-// resolveAutoConsistency is an initialization step of Dumper.
 func resolveAutoConsistency(d *Dumper) error {
 	conf := d.conf
 	if conf.Consistency == ConsistencyTypeAuto {
@@ -1376,114 +920,6 @@ func validateResolveAutoConsistency(d *Dumper) error {
 		return errors.Errorf("can't specify --snapshot when --consistency isn't snapshot, resolved consistency: %s", conf.Consistency)
 	}
 	return nil
-}
-
-// tidbSetPDClientForGC is an initialization step of Dumper.
-func tidbSetPDClientForGC(d *Dumper) error {
-	tctx, si, pool := d.tctx, d.conf.ServerInfo, d.dbHandle
-	if si.ServerType != version.ServerTypeTiDB ||
-		si.ServerVersion == nil ||
-		si.ServerVersion.Compare(*gcSafePointVersion) < 0 {
-		return nil
-	}
-	pdAddrs, err := GetPdAddrs(tctx, pool)
-	if err != nil {
-		tctx.L().Info("meet some problem while fetching pd addrs. This won't affect dump process", log.ShortError(err))
-		return nil
-	}
-	if len(pdAddrs) > 0 {
-		doPdGC, err := checkSameCluster(tctx, pool, pdAddrs)
-		if err != nil {
-			tctx.L().Info("meet error while check whether fetched pd addr and TiDB belong to one cluster. This won't affect dump process", log.ShortError(err), zap.Strings("pdAddrs", pdAddrs))
-		} else if doPdGC {
-			pdClient, err := pd.NewClientWithContext(tctx, pdAddrs, pd.SecurityOption{})
-			if err != nil {
-				tctx.L().Info("create pd client to control GC failed. This won't affect dump process", log.ShortError(err), zap.Strings("pdAddrs", pdAddrs))
-			}
-			d.tidbPDClientForGC = pdClient
-		}
-	}
-	return nil
-}
-
-// tidbGetSnapshot is an initialization step of Dumper.
-func tidbGetSnapshot(d *Dumper) error {
-	conf, doPdGC := d.conf, d.tidbPDClientForGC != nil
-	consistency := conf.Consistency
-	pool, tctx := d.dbHandle, d.tctx
-	snapshotConsistency := consistency == "snapshot"
-	if conf.Snapshot == "" && (doPdGC || snapshotConsistency) {
-		conn, err := pool.Conn(tctx)
-		if err != nil {
-			tctx.L().Warn("fail to open connection to get snapshot from TiDB", log.ShortError(err))
-			// for consistency snapshot, we must get a snapshot here, or we will dump inconsistent data, but for other consistency we can ignore this error.
-			if !snapshotConsistency {
-				err = nil
-			}
-			return err
-		}
-		snapshot, err := getSnapshot(conn)
-		_ = conn.Close()
-		if err != nil {
-			tctx.L().Warn("fail to get snapshot from TiDB", log.ShortError(err))
-			// for consistency snapshot, we must get a snapshot here, or we will dump inconsistent data, but for other consistency we can ignore this error.
-			if !snapshotConsistency {
-				err = nil
-			}
-			return err
-		}
-		conf.Snapshot = snapshot
-	}
-	return nil
-}
-
-// tidbStartGCSavepointUpdateService is an initialization step of Dumper.
-func tidbStartGCSavepointUpdateService(d *Dumper) error {
-	tctx, pool, conf := d.tctx, d.dbHandle, d.conf
-	snapshot, si := conf.Snapshot, conf.ServerInfo
-	if d.tidbPDClientForGC != nil {
-		snapshotTS, err := parseSnapshotToTSO(pool, snapshot)
-		if err != nil {
-			return err
-		}
-		go updateServiceSafePoint(tctx, d.tidbPDClientForGC, defaultDumpGCSafePointTTL, snapshotTS)
-	} else if si.ServerType == version.ServerTypeTiDB {
-		tctx.L().Warn("If the amount of data to dump is large, criteria: (data more than 60GB or dumped time more than 10 minutes)\n" +
-			"you'd better adjust the tikv_gc_life_time to avoid export failure due to TiDB GC during the dump process.\n" +
-			"Before dumping: run sql `update mysql.tidb set VARIABLE_VALUE = '720h' where VARIABLE_NAME = 'tikv_gc_life_time';` in tidb.\n" +
-			"After dumping: run sql `update mysql.tidb set VARIABLE_VALUE = '10m' where VARIABLE_NAME = 'tikv_gc_life_time';` in tidb.\n")
-	}
-	return nil
-}
-
-func updateServiceSafePoint(tctx *tcontext.Context, pdClient pd.Client, ttl int64, snapshotTS uint64) {
-	updateInterval := time.Duration(ttl/2) * time.Second
-	tick := time.NewTicker(updateInterval)
-	dumplingServiceSafePointID := fmt.Sprintf("%s_%d", dumplingServiceSafePointPrefix, time.Now().UnixNano())
-	tctx.L().Info("generate dumpling gc safePoint id", zap.String("id", dumplingServiceSafePointID))
-
-	for {
-		tctx.L().Debug("update PD safePoint limit with ttl",
-			zap.Uint64("safePoint", snapshotTS),
-			zap.Int64("ttl", ttl))
-		for retryCnt := 0; retryCnt <= 10; retryCnt++ {
-			_, err := pdClient.UpdateServiceGCSafePoint(tctx, dumplingServiceSafePointID, ttl, snapshotTS)
-			if err == nil {
-				break
-			}
-			tctx.L().Debug("update PD safePoint failed", log.ShortError(err), zap.Int("retryTime", retryCnt))
-			select {
-			case <-tctx.Done():
-				return
-			case <-time.After(time.Second):
-			}
-		}
-		select {
-		case <-tctx.Done():
-			return
-		case <-tick.C:
-		}
-	}
 }
 
 // setDefaultSessionParams is a step to set default params for session params.
@@ -1537,106 +973,6 @@ func openDB(cfg *mysql.Config) (*sql.DB, error) {
 	return sql.OpenDB(c), nil
 }
 
-func (d *Dumper) renewSelectTableRegionFuncForLowerTiDB(tctx *tcontext.Context) error {
-	conf := d.conf
-	if !(conf.ServerInfo.ServerType == version.ServerTypeTiDB && conf.ServerInfo.ServerVersion != nil && conf.ServerInfo.HasTiKV &&
-		conf.ServerInfo.ServerVersion.Compare(*decodeRegionVersion) >= 0 &&
-		conf.ServerInfo.ServerVersion.Compare(*gcSafePointVersion) < 0) {
-		tctx.L().Debug("no need to build region info because database is not TiDB 3.x")
-		return nil
-	}
-	// for TiDB v3.0+, the original selectTiDBTableRegionFunc will always fail,
-	// because TiDB v3.0 doesn't have `tidb_decode_key` function nor `DB_NAME`,`TABLE_NAME` columns in `INFORMATION_SCHEMA.TIKV_REGION_STATUS`.
-	// reference: https://github.com/pingcap/tidb/blob/c497d5c/dumpling/export/dump.go#L775
-	// To avoid this function continuously returning errors and confusing users because we fail to init this function at first,
-	// selectTiDBTableRegionFunc is set to always return an ignorable error at first.
-	d.selectTiDBTableRegionFunc = func(_ *tcontext.Context, _ *BaseConn, meta TableMeta) (pkFields []string, pkVals [][]string, err error) {
-		return nil, nil, errors.Annotatef(errEmptyHandleVals, "table: `%s`.`%s`", escapeString(meta.DatabaseName()), escapeString(meta.TableName()))
-	}
-	dbHandle, err := openDBFunc(conf.GetDriverConfig(""))
-	if err != nil {
-		return errors.Trace(err)
-	}
-	defer func() {
-		_ = dbHandle.Close()
-	}()
-	conn, err := dbHandle.Conn(tctx)
-	if err != nil {
-		return errors.Trace(err)
-	}
-	defer func() {
-		_ = conn.Close()
-	}()
-	dbInfos, err := GetDBInfo(conn, DatabaseTablesToMap(conf.Tables))
-	if err != nil {
-		return errors.Trace(err)
-	}
-	regionsInfo, err := GetRegionInfos(conn)
-	if err != nil {
-		return errors.Trace(err)
-	}
-	tikvHelper := &helper.Helper{}
-	tableInfos := tikvHelper.GetRegionsTableInfo(regionsInfo, infoschema.DBInfoAsInfoSchema(dbInfos), nil)
-
-	tableInfoMap := make(map[string]map[string][]int64, len(conf.Tables))
-	for _, region := range regionsInfo.Regions {
-		tableList := tableInfos[region.ID]
-		for _, table := range tableList {
-			db, tbl := table.DB.Name.O, table.Table.Name.O
-			if _, ok := tableInfoMap[db]; !ok {
-				tableInfoMap[db] = make(map[string][]int64, len(conf.Tables[db]))
-			}
-
-			key, err := hex.DecodeString(region.StartKey)
-			if err != nil {
-				d.L().Debug("invalid region start key", log.ShortError(err), zap.String("key", region.StartKey))
-				continue
-			}
-			// Auto decode byte if needed.
-			_, bs, err := codec.DecodeBytes(key, nil)
-			if err == nil {
-				key = bs
-			}
-			// Try to decode it as a record key.
-			tableID, handle, err := tablecodec.DecodeRecordKey(key)
-			if err != nil {
-				d.L().Debug("cannot decode region start key", log.ShortError(err), zap.String("key", region.StartKey), zap.Int64("tableID", tableID))
-				continue
-			}
-			if handle.IsInt() {
-				tableInfoMap[db][tbl] = append(tableInfoMap[db][tbl], handle.IntValue())
-			} else {
-				d.L().Debug("not an int handle", log.ShortError(err), zap.Stringer("handle", handle))
-			}
-		}
-	}
-	for _, tbInfos := range tableInfoMap {
-		for _, tbInfoLoop := range tbInfos {
-			// make sure tbInfo is only used in this loop
-			tbInfo := tbInfoLoop
-			slices.Sort(tbInfo)
-		}
-	}
-
-	d.selectTiDBTableRegionFunc = func(tctx *tcontext.Context, conn *BaseConn, meta TableMeta) (pkFields []string, pkVals [][]string, err error) {
-		pkFields, _, err = selectTiDBRowKeyFields(tctx, conn, meta, checkTiDBTableRegionPkFields)
-		if err != nil {
-			return
-		}
-		dbName, tableName := meta.DatabaseName(), meta.TableName()
-		if tbInfos, ok := tableInfoMap[dbName]; ok {
-			if tbInfo, ok := tbInfos[tableName]; ok {
-				pkVals = make([][]string, len(tbInfo))
-				for i, val := range tbInfo {
-					pkVals[i] = []string{strconv.FormatInt(val, 10)}
-				}
-			}
-		}
-		return
-	}
-
-	return nil
-}
 
 func (d *Dumper) newTaskTableData(meta TableMeta, data TableDataIR, currentChunk, totalChunks int) *TaskTableData {
 	d.metrics.totalChunks.Add(1)
