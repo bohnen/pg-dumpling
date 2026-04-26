@@ -146,7 +146,43 @@ Phase 1 で `getNumericIndex` を空文字返却にした穴を塞ぐ。
    - `GetPartitionNames` は Phase 1 で既に PG 用に書き直し済み
    - `concurrentDumpTable` から partition ごとに dump task 発行する経路を復活
 
-## 課題 3: `replace ~/Work/tidb` の解消
+## 課題 3: `replace ~/Work/tidb` の解消(進行中)
+
+### 04c で完了した削減
+
+7 パッケージ → **1 パッケージ**に縮小:
+
+| パッケージ | 04c 後の状態 |
+|---|---|
+| `br/pkg/version` | ❌ 削除(`Config.ServerInfo` 自体撤廃) |
+| `pkg/util/promutil` | ❌ stdlib `prometheus.Registerer` 直叩きに置換 |
+| `br/pkg/utils.WithRetry` | ❌ `retry.go` に inline(~30 行) |
+| `br/pkg/summary` | ❌ zap log 呼び出しに置換 |
+| `pkg/util` (TLS) | ❌ stdlib `crypto/tls` + `crypto/x509` に書き換え |
+| `pkg/util/table-filter` | ✅ `internal/table-filter/` に vendor(`pingcap/errors` のみ依存) |
+| `br/pkg/storage` | 🔧 **未対応**(transitive deps 多数) |
+
+### `br/pkg/storage` を取り込むには
+
+単純コピーではダメで、storage が以下を更に要求する:
+
+- `br/pkg/errors`、`br/pkg/logutil`、`br/pkg/utils`、`br/pkg/utils/iter`
+- `pkg/util`、`pkg/util/intest`、`pkg/util/logutil`、`pkg/util/prefetch`
+- `pkg/sessionctx/variable`、`pkg/lightning/log`
+
+これら全部を vendor すると行数が膨大になり「dump ツール」のリポジトリとしては不釣り合い。
+**選択肢**:
+
+(a) **クラウドバックエンドを切り捨てる** — `--output /path/to/dir` のみサポート。
+    `local.go` + `compress.go` + `storage.go` の核だけ inline。S3/GCS/Azure/HDFS/ks3
+    はユーザ側で `aws s3 cp` 等の後段処理にしてもらう
+(b) **`replace` をしばらく残す** — 現状維持
+(c) **TiDB を public commit に pin** — `replace` を消す代わりに `require
+    github.com/pingcap/tidb v0.0.0-<sha>` で公開リポジトリから引く
+
+Phase 3 で (a) を有力候補として再検討する想定。Phase 2 では (b) を採用。
+
+
 
 `go.mod` から `replace github.com/pingcap/tidb => ...` を消すには現在依存している
 以下を `internal/` に取り込むか書き直す:

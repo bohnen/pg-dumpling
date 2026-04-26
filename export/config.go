@@ -19,7 +19,7 @@ import (
 	"github.com/docker/go-units"
 	"github.com/pingcap/errors"
 	"github.com/pingcap/tidb/br/pkg/storage"
-	filter "github.com/pingcap/tidb/pkg/util/table-filter"
+	filter "github.com/tadapin/pg-dumpling/internal/table-filter"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/spf13/pflag"
 	"go.uber.org/zap"
