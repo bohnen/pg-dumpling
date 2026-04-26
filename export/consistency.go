@@ -69,7 +69,8 @@ type ConsistencySnapshot struct {
 	snapshotName string
 }
 
-// Setup begins the snapshot transaction and captures the token.
+// Setup begins the snapshot transaction and captures the token. The token is
+// also published via SetPgSnapshotToken so worker connections can adopt it.
 func (c *ConsistencySnapshot) Setup(tctx *tcontext.Context) error {
 	if _, err := c.conn.ExecContext(tctx, "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY"); err != nil {
 		return errors.Annotate(err, "begin snapshot transaction")
@@ -79,6 +80,7 @@ func (c *ConsistencySnapshot) Setup(tctx *tcontext.Context) error {
 			return errors.Annotate(err, "set transaction snapshot")
 		}
 		c.snapshotName = c.conf.Snapshot
+		SetPgSnapshotToken(c.snapshotName)
 		return nil
 	}
 	row := c.conn.QueryRowContext(tctx, "SELECT pg_export_snapshot()")
@@ -88,6 +90,7 @@ func (c *ConsistencySnapshot) Setup(tctx *tcontext.Context) error {
 	}
 	c.snapshotName = token
 	c.conf.Snapshot = token
+	SetPgSnapshotToken(token)
 	return nil
 }
 

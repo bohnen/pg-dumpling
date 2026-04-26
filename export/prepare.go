@@ -81,29 +81,18 @@ func ParseOutputFileTemplate(text string) (*template.Template, error) {
 	return template.Must(DefaultOutputFileTemplate.Clone()).Parse(text)
 }
 
+// prepareDumpingDatabases discovers the PostgreSQL schemas inside the
+// connected database. In dumpling's "database" vocabulary this means
+// schemas (pg_namespace rows) — PostgreSQL databases are selected at
+// connection time via the DSN, so conf.Databases[0] just sets PGDATABASE
+// and isn't a filter here. Schema filtering goes through conf.TableFilter
+// (`--filter "schema.table"`) instead.
 func prepareDumpingDatabases(tctx *tcontext.Context, conf *Config, db *sql.Conn) ([]string, error) {
 	databases, err := ShowDatabases(db)
 	if err != nil {
 		return nil, err
 	}
-	databases = filterDatabases(tctx, conf, databases)
-	if len(conf.Databases) == 0 {
-		return databases, nil
-	}
-	dbMap := make(map[string]any, len(databases))
-	for _, database := range databases {
-		dbMap[database] = struct{}{}
-	}
-	var notExistsDatabases []string
-	for _, database := range conf.Databases {
-		if _, ok := dbMap[database]; !ok {
-			notExistsDatabases = append(notExistsDatabases, database)
-		}
-	}
-	if len(notExistsDatabases) > 0 {
-		return nil, errors.Errorf("Unknown databases [%s]", strings.Join(notExistsDatabases, ","))
-	}
-	return conf.Databases, nil
+	return filterDatabases(tctx, conf, databases), nil
 }
 
 type databaseName = string

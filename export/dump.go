@@ -100,6 +100,7 @@ func NewDumper(ctx context.Context, conf *Config) (*Dumper, error) {
 		createExternalStore,
 		startHTTPService,
 		openSQLDB,
+		setupPgDumpEnv,
 		resolveAutoConsistency,
 		validateResolveAutoConsistency,
 		setSessionParam)
@@ -804,6 +805,39 @@ func openSQLDB(d *Dumper) error {
 		return errors.Trace(err)
 	}
 	d.dbHandle = db
+	return nil
+}
+
+// setupPgDumpEnv records the PGHOST/PGPORT/PGUSER/PGPASSWORD/PGSSLMODE
+// envs that runPgDumpSchema will hand to its pg_dump child process.
+func setupPgDumpEnv(d *Dumper) error {
+	conf := d.conf
+	env := []string{
+		fmt.Sprintf("PGHOST=%s", conf.Host),
+		fmt.Sprintf("PGPORT=%d", conf.Port),
+	}
+	if conf.User != "" {
+		env = append(env, "PGUSER="+conf.User)
+	}
+	if conf.Password != "" {
+		env = append(env, "PGPASSWORD="+conf.Password)
+	}
+	if conf.Security.SSLMode != "" {
+		env = append(env, "PGSSLMODE="+conf.Security.SSLMode)
+	}
+	if conf.Security.CAPath != "" {
+		env = append(env, "PGSSLROOTCERT="+conf.Security.CAPath)
+	}
+	if conf.Security.CertPath != "" {
+		env = append(env, "PGSSLCERT="+conf.Security.CertPath)
+	}
+	if conf.Security.KeyPath != "" {
+		env = append(env, "PGSSLKEY="+conf.Security.KeyPath)
+	}
+	if len(conf.Databases) > 0 {
+		env = append(env, "PGDATABASE="+conf.Databases[0])
+	}
+	SetPgDumpEnv(env)
 	return nil
 }
 

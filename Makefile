@@ -18,7 +18,7 @@ GOTEST := go test -v -timeout 5m
 all: build
 
 build:
-	$(GOBUILD) -o bin/dumpling ./cmd/dumpling
+	$(GOBUILD) -o bin/pg-dumpling ./cmd/pg-dumpling
 
 test: test-unit
 
@@ -44,7 +44,7 @@ clean:
 
 help:
 	@echo "Targets:"
-	@echo "  build      build bin/dumpling"
+	@echo "  build      build bin/pg-dumpling"
 	@echo "  test       alias of test-unit"
 	@echo "  test-unit  short unit tests for log/ and export/"
 	@echo "  vet        go vet ./..."

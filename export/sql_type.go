@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"fmt"
+	"strings"
 )
 
 var colTypeRowReceiverMap = map[string]func() RowReceiverStringer{}
@@ -17,147 +18,61 @@ var (
 	twoQuotationMarks = []byte{'\'', '\''}
 )
 
-// There are two kinds of scenes to use this dataType
-// The first is to be the receiver of table sample, which will use tidb's INFORMATION_SCHEMA.COLUMNS's DATA_TYPE column, which is from
-// https://github.com/pingcap/tidb/blob/619c4720059ea619081b01644ef3084b426d282f/executor/infoschema_reader.go#L654
-// https://github.com/pingcap/parser/blob/8e8ed7927bde11c4cf0967afc5e05ab5aeb14cc7/types/etc.go#L44-70
-// The second is to be the receiver of select row type, which will use sql.DB's rows.DatabaseTypeName(), which is from
-// https://github.com/go-sql-driver/mysql/blob/v1.5.0/fields.go#L17-97
+// initColTypeRowReceiverMap maps PostgreSQL column type names — as returned
+// by pgx via *sql.ColumnType.DatabaseTypeName() — to a row-receiver factory.
+// pgx returns the lowercase canonical type name for built-ins (e.g. "int4",
+// "text", "bytea", "jsonb") and the type's name without schema for others.
+//
+// Three receivers cover the entire surface:
+//   - SQLTypeNumber: integer / floating / numeric / boolean output unquoted
+//     (their textual form is already a valid SQL literal).
+//   - SQLTypeBytes:  bytea formatted as PostgreSQL hex literal '\xDEADBEEF'.
+//   - SQLTypeString: everything else — wrapped in single quotes with SQL
+//     standard quote-doubling escape.
 func initColTypeRowReceiverMap() {
-	dataTypeStringArr := []string{
-		"CHAR", "NCHAR", "VARCHAR", "NVARCHAR", "CHARACTER", "VARCHARACTER",
-		"TIMESTAMP", "DATETIME", "DATE", "TIME", "YEAR", "SQL_TSI_YEAR",
-		"TEXT", "TINYTEXT", "MEDIUMTEXT", "LONGTEXT",
-		"ENUM", "SET", "JSON", "NULL", "VAR_STRING",
+	numberTypes := []string{
+		"int2", "int4", "int8", "smallint", "integer", "bigint",
+		"float4", "float8", "real", "double precision",
+		"numeric", "decimal", "money",
+		"oid", "xid", "cid", "tid",
+		"bool", "boolean",
 	}
-
-	dataTypeIntArr := []string{
-		"INTEGER", "BIGINT", "TINYINT", "SMALLINT", "MEDIUMINT",
-		"INT", "INT1", "INT2", "INT3", "INT8",
-		"UNSIGNED INT", "UNSIGNED BIGINT", "UNSIGNED TINYINT", "UNSIGNED SMALLINT", // introduced in https://github.com/go-sql-driver/mysql/pull/1238
+	binaryTypes := []string{
+		"bytea",
 	}
-
-	dataTypeNumArr := append(dataTypeIntArr, []string{
-		"FLOAT", "REAL", "DOUBLE", "DOUBLE PRECISION",
-		"DECIMAL", "NUMERIC", "FIXED",
-		"BOOL", "BOOLEAN",
-	}...)
-
-	dataTypeBinArr := []string{
-		"BLOB", "TINYBLOB", "MEDIUMBLOB", "LONGBLOB", "LONG",
-		"BINARY", "VARBINARY",
-		"BIT", "GEOMETRY",
+	for _, t := range numberTypes {
+		colTypeRowReceiverMap[strings.ToUpper(t)] = SQLTypeNumberMaker
+		colTypeRowReceiverMap[strings.ToLower(t)] = SQLTypeNumberMaker
+		dataTypeInt[strings.ToUpper(t)] = struct{}{}
+		dataTypeInt[strings.ToLower(t)] = struct{}{}
 	}
-
-	for _, s := range dataTypeStringArr {
-		dataTypeString[s] = struct{}{}
-		colTypeRowReceiverMap[s] = SQLTypeStringMaker
+	for _, t := range binaryTypes {
+		colTypeRowReceiverMap[strings.ToUpper(t)] = SQLTypeBytesMaker
+		colTypeRowReceiverMap[strings.ToLower(t)] = SQLTypeBytesMaker
+		dataTypeBin[strings.ToUpper(t)] = struct{}{}
+		dataTypeBin[strings.ToLower(t)] = struct{}{}
 	}
-	for _, s := range dataTypeIntArr {
-		dataTypeInt[s] = struct{}{}
-	}
-	for _, s := range dataTypeNumArr {
-		colTypeRowReceiverMap[s] = SQLTypeNumberMaker
-	}
-	for _, s := range dataTypeBinArr {
-		dataTypeBin[s] = struct{}{}
-		colTypeRowReceiverMap[s] = SQLTypeBytesMaker
-	}
+	// All other types (text, varchar, char, date, timestamp(tz), time(tz),
+	// interval, uuid, inet, cidr, macaddr, json, jsonb, range/multirange,
+	// arrays, enums, domain types) fall through MakeRowReceiver's default to
+	// SQLTypeStringMaker.
 }
 
 var dataTypeString, dataTypeInt, dataTypeBin = make(map[string]struct{}), make(map[string]struct{}), make(map[string]struct{})
 
-func escapeBackslashSQL(s []byte, bf *bytes.Buffer) {
-	var (
-		escape byte
-		last   = 0
-	)
-	// reference: https://gist.github.com/siddontang/8875771
-	for i := 0; i < len(s); i++ {
-		escape = 0
-
-		switch s[i] {
-		case 0: /* Must be escaped for 'mysql' */
-			escape = '0'
-		case '\n': /* Must be escaped for logs */
-			escape = 'n'
-		case '\r':
-			escape = 'r'
-		case '\\':
-			escape = '\\'
-		case '\'':
-			escape = '\''
-		case '"': /* Better safe than sorry */
-			escape = '"'
-		case '\032': /* This gives problems on Win32 */
-			escape = 'Z'
-		}
-
-		if escape != 0 {
-			bf.Write(s[last:i])
-			bf.WriteByte('\\')
-			bf.WriteByte(escape)
-			last = i + 1
-		}
-	}
-	bf.Write(s[last:])
+// escapeSQL emits a PostgreSQL string literal body. With
+// standard_conforming_strings = on (the modern default), only single quotes
+// need escaping and they are doubled.
+func escapeSQL(s []byte, bf *bytes.Buffer, _ bool) {
+	bf.Write(bytes.ReplaceAll(s, quotationMark, twoQuotationMarks))
 }
 
-func escapeBackslashCSV(s []byte, bf *bytes.Buffer, opt *csvOption) {
-	var (
-		escape  byte
-		last    int
-		specCmt byte
-	)
+func escapeCSV(s []byte, bf *bytes.Buffer, _ bool, opt *csvOption) {
 	if len(opt.delimiter) > 0 {
-		specCmt = opt.delimiter[0] // if csv has a delimiter, we should use backslash to comment the delimiter in field value
-	} else if len(opt.separator) > 0 {
-		specCmt = opt.separator[0] // if csv's delimiter is "", we should escape the separator to avoid error
-	}
-
-	for i := 0; i < len(s); i++ {
-		escape = 0
-
-		switch s[i] {
-		case 0: /* Must be escaped for 'mysql' */
-			escape = '0'
-		case '\r':
-			escape = 'r'
-		case '\n': /* escaped for line terminators */
-			escape = 'n'
-		case '\\':
-			escape = '\\'
-		case specCmt:
-			escape = specCmt
-		}
-
-		if escape != 0 {
-			bf.Write(s[last:i])
-			bf.WriteByte('\\')
-			bf.WriteByte(escape)
-			last = i + 1
-		}
-	}
-	bf.Write(s[last:])
-}
-
-func escapeSQL(s []byte, bf *bytes.Buffer, escapeBackslash bool) { // revive:disable-line:flag-parameter
-	if escapeBackslash {
-		escapeBackslashSQL(s, bf)
-	} else {
-		bf.Write(bytes.ReplaceAll(s, quotationMark, twoQuotationMarks))
-	}
-}
-
-func escapeCSV(s []byte, bf *bytes.Buffer, escapeBackslash bool, opt *csvOption) { // revive:disable-line:flag-parameter
-	switch {
-	case escapeBackslash:
-		escapeBackslashCSV(s, bf, opt)
-	case len(opt.delimiter) > 0:
 		bf.Write(bytes.ReplaceAll(s, opt.delimiter, append(opt.delimiter, opt.delimiter...)))
-	default:
-		bf.Write(s)
+		return
 	}
+	bf.Write(s)
 }
 
 // SQLTypeStringMaker returns a SQLTypeString
@@ -181,6 +96,9 @@ func MakeRowReceiver(colTypes []string) *RowReceiverArr {
 	for i, colTp := range colTypes {
 		recMaker, ok := colTypeRowReceiverMap[colTp]
 		if !ok {
+			recMaker = colTypeRowReceiverMap[strings.ToLower(colTp)]
+		}
+		if recMaker == nil {
 			recMaker = SQLTypeStringMaker
 		}
 		rowReceiverArr[i] = recMaker()
@@ -230,12 +148,11 @@ func (r *RowReceiverArr) WriteToBufferInCsv(bf *bytes.Buffer, escapeBackslash bo
 	}
 }
 
-// SQLTypeNumber implements RowReceiverStringer which represents numeric type columns in database
+// SQLTypeNumber implements RowReceiverStringer for numeric / boolean columns.
 type SQLTypeNumber struct {
 	SQLTypeString
 }
 
-// WriteToBuffer implements Stringer.WriteToBuffer
 func (s SQLTypeNumber) WriteToBuffer(bf *bytes.Buffer, _ bool) {
 	if s.RawBytes != nil {
 		bf.Write(s.RawBytes)
@@ -244,7 +161,6 @@ func (s SQLTypeNumber) WriteToBuffer(bf *bytes.Buffer, _ bool) {
 	}
 }
 
-// WriteToBufferInCsv implements Stringer.WriteToBufferInCsv
 func (s SQLTypeNumber) WriteToBufferInCsv(bf *bytes.Buffer, _ bool, opt *csvOption) {
 	if s.RawBytes != nil {
 		bf.Write(s.RawBytes)
@@ -253,17 +169,13 @@ func (s SQLTypeNumber) WriteToBufferInCsv(bf *bytes.Buffer, _ bool, opt *csvOpti
 	}
 }
 
-// SQLTypeString implements RowReceiverStringer which represents string type columns in database
+// SQLTypeString covers everything that should be quoted as a string literal.
 type SQLTypeString struct {
 	sql.RawBytes
 }
 
-// BindAddress implements RowReceiver.BindAddress
-func (s *SQLTypeString) BindAddress(arg []any) {
-	arg[0] = &s.RawBytes
-}
+func (s *SQLTypeString) BindAddress(arg []any) { arg[0] = &s.RawBytes }
 
-// WriteToBuffer implements Stringer.WriteToBuffer
 func (s *SQLTypeString) WriteToBuffer(bf *bytes.Buffer, escapeBackslash bool) {
 	if s.RawBytes != nil {
 		bf.Write(quotationMark)
@@ -274,7 +186,6 @@ func (s *SQLTypeString) WriteToBuffer(bf *bytes.Buffer, escapeBackslash bool) {
 	}
 }
 
-// WriteToBufferInCsv implements Stringer.WriteToBufferInCsv
 func (s *SQLTypeString) WriteToBufferInCsv(bf *bytes.Buffer, escapeBackslash bool, opt *csvOption) {
 	if s.RawBytes != nil {
 		bf.Write(opt.delimiter)
@@ -285,26 +196,21 @@ func (s *SQLTypeString) WriteToBufferInCsv(bf *bytes.Buffer, escapeBackslash boo
 	}
 }
 
-// SQLTypeBytes implements RowReceiverStringer which represents bytes type columns in database
+// SQLTypeBytes formats binary columns as PostgreSQL '\xHEX' bytea literals.
 type SQLTypeBytes struct {
 	sql.RawBytes
 }
 
-// BindAddress implements RowReceiver.BindAddress
-func (s *SQLTypeBytes) BindAddress(arg []any) {
-	arg[0] = &s.RawBytes
-}
+func (s *SQLTypeBytes) BindAddress(arg []any) { arg[0] = &s.RawBytes }
 
-// WriteToBuffer implements Stringer.WriteToBuffer
 func (s *SQLTypeBytes) WriteToBuffer(bf *bytes.Buffer, _ bool) {
 	if s.RawBytes != nil {
-		fmt.Fprintf(bf, "x'%x'", s.RawBytes)
+		fmt.Fprintf(bf, `'\x%x'`, s.RawBytes)
 	} else {
 		bf.WriteString(nullValue)
 	}
 }
 
-// WriteToBufferInCsv implements Stringer.WriteToBufferInCsv
 func (s *SQLTypeBytes) WriteToBufferInCsv(bf *bytes.Buffer, escapeBackslash bool, opt *csvOption) {
 	if s.RawBytes != nil {
 		bf.Write(opt.delimiter)

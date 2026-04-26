@@ -7,8 +7,6 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"io"
-	"math"
 	"os"
 	"os/exec"
 	"strconv"
@@ -139,307 +137,145 @@ func ShowCreateTable(tctx *tcontext.Context, _ *BaseConn, database, table string
 	return runPgDumpSchema(tctx, database, table, false)
 }
 
-// ShowCreateView constructs the create view SQL for a specified view
-// returns (createFakeTableSQL, createViewSQL, error)
-func ShowCreateView(tctx *tcontext.Context, db *BaseConn, database, view string) (createFakeTableSQL string, createRealViewSQL string, err error) {
-	var fieldNames []string
-	handleFieldRow := func(rows *sql.Rows) error {
-		var oneRow [6]sql.NullString
-		scanErr := rows.Scan(&oneRow[0], &oneRow[1], &oneRow[2], &oneRow[3], &oneRow[4], &oneRow[5])
-		if scanErr != nil {
-			return errors.Trace(scanErr)
-		}
-		if oneRow[0].Valid {
-			fieldNames = append(fieldNames, fmt.Sprintf("`%s` int", escapeString(oneRow[0].String)))
-		}
-		return nil
-	}
-	var oneRow [4]string
-	handleOneRow := func(rows *sql.Rows) error {
-		return rows.Scan(&oneRow[0], &oneRow[1], &oneRow[2], &oneRow[3])
-	}
-	var createTableSQL, createViewSQL strings.Builder
-
-	// Build createTableSQL
-	query := fmt.Sprintf("SHOW FIELDS FROM `%s`.`%s`", escapeString(database), escapeString(view))
-	err = db.QuerySQL(tctx, handleFieldRow, func() {
-		fieldNames = []string{}
-	}, query)
+// ShowCreateView shells out to pg_dump for a view's DDL. The first return
+// (createFakeTableSQL) is empty for Postgres — PG views don't need the MySQL
+// "fake table" preamble that lets a downstream loader resolve circular
+// dependencies; pg_dump emits the view in dependency order itself.
+func ShowCreateView(tctx *tcontext.Context, _ *BaseConn, database, view string) (createFakeTableSQL string, createRealViewSQL string, err error) {
+	ddl, err := runPgDumpSchema(tctx, database, view, true)
 	if err != nil {
 		return "", "", err
 	}
-	fmt.Fprintf(&createTableSQL, "CREATE TABLE `%s`(\n", escapeString(view))
-	createTableSQL.WriteString(strings.Join(fieldNames, ",\n"))
-	createTableSQL.WriteString("\n)ENGINE=MyISAM;\n")
+	return "", ddl, nil
+}
 
-	// Build createViewSQL
-	fmt.Fprintf(&createViewSQL, "DROP TABLE IF EXISTS `%s`;\n", escapeString(view))
-	fmt.Fprintf(&createViewSQL, "DROP VIEW IF EXISTS `%s`;\n", escapeString(view))
-	query = fmt.Sprintf("SHOW CREATE VIEW `%s`.`%s`", escapeString(database), escapeString(view))
-	err = db.QuerySQL(tctx, handleOneRow, func() {
-		for i := range oneRow {
-			oneRow[i] = ""
+// updateSpecifiedTablesMeta fills in Type and AvgRowLength for the
+// already-collected (schema, table) entries in dbTables. listType is ignored
+// in the PG implementation; we always use the same pg_class / pg_namespace
+// query.
+func updateSpecifiedTablesMeta(tctx *tcontext.Context, db *sql.Conn, dbTables DatabaseTables, _ listTableType) error {
+	const q = `
+SELECT n.nspname,
+       c.relname,
+       CASE c.relkind
+         WHEN 'r' THEN 'BASE TABLE'
+         WHEN 'p' THEN 'BASE TABLE'
+         WHEN 'v' THEN 'VIEW'
+         WHEN 'm' THEN 'VIEW'
+         WHEN 'S' THEN 'SEQUENCE'
+         ELSE 'BASE TABLE'
+       END AS table_type,
+       COALESCE(
+         CASE WHEN c.reltuples > 0
+              THEN (pg_relation_size(c.oid) / c.reltuples)::bigint
+              ELSE 0
+         END, 0) AS avg_row_length
+FROM pg_catalog.pg_class c
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = ANY($1) AND c.relname = ANY($2)`
+	schemas := make([]string, 0, len(dbTables))
+	tables := make([]string, 0)
+	for schema, tbls := range dbTables {
+		schemas = append(schemas, schema)
+		for _, tbl := range tbls {
+			tables = append(tables, tbl.Name)
 		}
-	}, query)
+	}
+	rows, err := db.QueryContext(tctx, q, anyStringArray(schemas), anyStringArray(tables))
 	if err != nil {
-		return "", "", err
+		return errors.Annotatef(err, "sql: %s", q)
 	}
-	// The result for `show create view` SQL
-	// mysql> show create view v1;
-	// +------+-------------------------------------------------------------------------------------------------------------------------------------+----------------------+----------------------+
-	// | View | Create View                                                                                                                         | character_set_client | collation_connection |
-	// +------+-------------------------------------------------------------------------------------------------------------------------------------+----------------------+----------------------+
-	// | v1   | CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`localhost` SQL SECURITY DEFINER VIEW `v1` (`a`) AS SELECT `t`.`a` AS `a` FROM `test`.`t` | utf8                 | utf8_general_ci      |
-	// +------+-------------------------------------------------------------------------------------------------------------------------------------+----------------------+----------------------+
-	SetCharset(&createViewSQL, oneRow[2], oneRow[3])
-	createViewSQL.WriteString(oneRow[1])
-	createViewSQL.WriteString(";\n")
-	RestoreCharset(&createViewSQL)
-
-	return createTableSQL.String(), createViewSQL.String(), nil
-}
-
-// SetCharset builds the set charset SQLs
-func SetCharset(w *strings.Builder, characterSet, collationConnection string) {
-	w.WriteString("SET @PREV_CHARACTER_SET_CLIENT=@@CHARACTER_SET_CLIENT;\n")
-	w.WriteString("SET @PREV_CHARACTER_SET_RESULTS=@@CHARACTER_SET_RESULTS;\n")
-	w.WriteString("SET @PREV_COLLATION_CONNECTION=@@COLLATION_CONNECTION;\n")
-
-	fmt.Fprintf(w, "SET character_set_client = %s;\n", characterSet)
-	fmt.Fprintf(w, "SET character_set_results = %s;\n", characterSet)
-	fmt.Fprintf(w, "SET collation_connection = %s;\n", collationConnection)
-}
-
-// RestoreCharset builds the restore charset SQLs
-func RestoreCharset(w io.StringWriter) {
-	_, _ = w.WriteString("SET character_set_client = @PREV_CHARACTER_SET_CLIENT;\n")
-	_, _ = w.WriteString("SET character_set_results = @PREV_CHARACTER_SET_RESULTS;\n")
-	_, _ = w.WriteString("SET collation_connection = @PREV_COLLATION_CONNECTION;\n")
-}
-
-// updateSpecifiedTablesMeta updates DatabaseTables with correct table type and avg row size.
-func updateSpecifiedTablesMeta(tctx *tcontext.Context, db *sql.Conn, dbTables DatabaseTables, listType listTableType) error {
-	var (
-		schema, table, tableTypeStr string
-		tableType                   TableType
-		avgRowLength                uint64
-		err                         error
-	)
-	switch listType {
-	case listTableByInfoSchema:
-		dbNames := make([]string, 0, len(dbTables))
-		for db := range dbTables {
-			dbNames = append(dbNames, fmt.Sprintf("'%s'", db))
+	defer rows.Close()
+	for rows.Next() {
+		var (
+			schema, name, ttype string
+			avgRowLength        sql.NullInt64
+		)
+		if err := rows.Scan(&schema, &name, &ttype, &avgRowLength); err != nil {
+			return errors.Trace(err)
 		}
-		query := fmt.Sprintf("SELECT TABLE_SCHEMA,TABLE_NAME,TABLE_TYPE,AVG_ROW_LENGTH FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA IN (%s)", strings.Join(dbNames, ","))
-		if err := simpleQueryWithArgs(tctx, db, func(rows *sql.Rows) error {
-			var (
-				sqlAvgRowLength sql.NullInt64
-				err2            error
-			)
-			if err2 = rows.Scan(&schema, &table, &tableTypeStr, &sqlAvgRowLength); err != nil {
-				return errors.Trace(err2)
-			}
-
-			tbls, ok := dbTables[schema]
-			if !ok {
-				return nil
-			}
-			for _, tbl := range tbls {
-				if tbl.Name == table {
-					tableType, err2 = ParseTableType(tableTypeStr)
-					if err2 != nil {
-						return errors.Trace(err2)
-					}
-					if sqlAvgRowLength.Valid {
-						avgRowLength = uint64(sqlAvgRowLength.Int64)
-					} else {
-						avgRowLength = 0
-					}
-					tbl.Type = tableType
-					tbl.AvgRowLength = avgRowLength
-				}
-			}
-			return nil
-		}, query); err != nil {
-			return errors.Annotatef(err, "sql: %s", query)
+		tableType, err := ParseTableType(ttype)
+		if err != nil {
+			return errors.Trace(err)
 		}
-		return nil
-	case listTableByShowFullTables:
-		for schema, tbls := range dbTables {
-			query := fmt.Sprintf("SHOW FULL TABLES FROM `%s`",
-				escapeString(schema))
-			if err := simpleQueryWithArgs(tctx, db, func(rows *sql.Rows) error {
-				var err2 error
-				if err2 = rows.Scan(&table, &tableTypeStr); err != nil {
-					return errors.Trace(err2)
-				}
-				for _, tbl := range tbls {
-					if tbl.Name == table {
-						tableType, err2 = ParseTableType(tableTypeStr)
-						if err2 != nil {
-							return errors.Trace(err2)
-						}
-						tbl.Type = tableType
-					}
-				}
-				return nil
-			}, query); err != nil {
-				return errors.Annotatef(err, "sql: %s", query)
-			}
-		}
-		return nil
-	default:
-		const queryTemplate = "SHOW TABLE STATUS FROM `%s`"
-		for schema, tbls := range dbTables {
-			query := fmt.Sprintf(queryTemplate, escapeString(schema))
-			rows, err := db.QueryContext(tctx, query)
-			if err != nil {
-				return errors.Annotatef(err, "sql: %s", query)
-			}
-			results, err := GetSpecifiedColumnValuesAndClose(rows, "NAME", "ENGINE", "AVG_ROW_LENGTH", "COMMENT")
-			if err != nil {
-				return errors.Annotatef(err, "sql: %s", query)
-			}
-			for _, oneRow := range results {
-				table, engine, avgRowLengthStr, comment := oneRow[0], oneRow[1], oneRow[2], oneRow[3]
-				for _, tbl := range tbls {
-					if tbl.Name == table {
-						if avgRowLengthStr != "" {
-							avgRowLength, err = strconv.ParseUint(avgRowLengthStr, 10, 64)
-							if err != nil {
-								return errors.Annotatef(err, "sql: %s", query)
-							}
-						} else {
-							avgRowLength = 0
-						}
-						tbl.AvgRowLength = avgRowLength
-						tableType = TableTypeBase
-						if engine == "" && (comment == "" || comment == TableTypeViewStr) {
-							tableType = TableTypeView
-						} else if engine == "" {
-							tctx.L().Warn("invalid table without engine found", zap.String("database", schema), zap.String("table", table))
-							continue
-						}
-						tbl.Type = tableType
-					}
+		for _, tbl := range dbTables[schema] {
+			if tbl.Name == name {
+				tbl.Type = tableType
+				if avgRowLength.Valid {
+					tbl.AvgRowLength = uint64(avgRowLength.Int64)
 				}
 			}
 		}
-		return nil
 	}
+	return rows.Err()
 }
 
-// ListAllDatabasesTables lists all the databases and tables from the database
-// listTableByInfoSchema list tables by table information_schema in MySQL
-// listTableByShowTableStatus has better performance than listTableByInfoSchema
-// listTableByShowFullTables is used in mysql8 version [8.0.3,8.0.23), more details can be found in the comments of func matchMysqlBugversion
+// anyStringArray converts a Go []string into the pgx-friendly form for
+// `WHERE col = ANY($1)` predicates. pgx accepts []string directly so we can
+// just return it; the helper exists to make call sites read clearly.
+func anyStringArray(s []string) []string { return s }
+
+// ListAllDatabasesTables enumerates the tables/views inside the given
+// schemas, filtered to the requested TableType set. Always uses the same
+// pg_class JOIN; listType is ignored.
 func ListAllDatabasesTables(tctx *tcontext.Context, db *sql.Conn, databaseNames []string,
-	listType listTableType, tableTypes ...TableType) (DatabaseTables, error) { // revive:disable-line:flag-parameter
+	_ listTableType, tableTypes ...TableType) (DatabaseTables, error) {
 	dbTables := DatabaseTables{}
-	var (
-		table, tableTypeStr string
-		tableType           TableType
-		avgRowLength        uint64
-		err                 error
-	)
-
-	tableTypeConditions := make([]string, len(tableTypes))
-	for i, tableType := range tableTypes {
-		tableTypeConditions[i] = fmt.Sprintf("TABLE_TYPE='%s'", tableType)
+	for _, schema := range databaseNames {
+		dbTables[schema] = make([]*TableInfo, 0)
 	}
-	switch listType {
-	case listTableByInfoSchema:
-		for _, schema := range databaseNames {
-			query := fmt.Sprintf("SELECT TABLE_NAME,TABLE_TYPE,AVG_ROW_LENGTH FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA=? AND (%s)", strings.Join(tableTypeConditions, " OR "))
-			dbTables[schema] = make([]*TableInfo, 0)
-			if err = simpleQueryWithArgs(tctx, db, func(rows *sql.Rows) error {
-				var (
-					sqlAvgRowLength sql.NullInt64
-					err2            error
-				)
-				if err2 = rows.Scan(&table, &tableTypeStr, &sqlAvgRowLength); err != nil {
-					return errors.Trace(err2)
-				}
-				tableType, err2 = ParseTableType(tableTypeStr)
-				if err2 != nil {
-					return errors.Trace(err2)
-				}
-
-				if sqlAvgRowLength.Valid {
-					avgRowLength = uint64(sqlAvgRowLength.Int64)
-				} else {
-					avgRowLength = 0
-				}
-				dbTables[schema] = append(dbTables[schema], &TableInfo{table, avgRowLength, tableType})
-				return nil
-			}, query, schema); err != nil {
-				return nil, errors.Annotatef(err, "sql: %s", query)
-			}
-		}
-	case listTableByShowFullTables:
-		for _, schema := range databaseNames {
-			dbTables[schema] = make([]*TableInfo, 0)
-			query := fmt.Sprintf("SHOW FULL TABLES FROM `%s` WHERE %s",
-				escapeString(schema), strings.Join(tableTypeConditions, " OR "))
-			if err = simpleQueryWithArgs(tctx, db, func(rows *sql.Rows) error {
-				var err2 error
-				if err2 = rows.Scan(&table, &tableTypeStr); err != nil {
-					return errors.Trace(err2)
-				}
-				tableType, err2 = ParseTableType(tableTypeStr)
-				if err2 != nil {
-					return errors.Trace(err2)
-				}
-				avgRowLength = 0 // can't get avgRowLength from the result of `show full tables` so hardcode to 0 here
-				dbTables[schema] = append(dbTables[schema], &TableInfo{table, avgRowLength, tableType})
-				return nil
-			}, query); err != nil {
-				return nil, errors.Annotatef(err, "sql: %s", query)
-			}
-		}
-	default:
-		const queryTemplate = "SHOW TABLE STATUS FROM `%s`"
-		selectedTableType := make(map[TableType]struct{})
-		for _, tableType = range tableTypes {
-			selectedTableType[tableType] = struct{}{}
-		}
-		for _, schema := range databaseNames {
-			dbTables[schema] = make([]*TableInfo, 0)
-			query := fmt.Sprintf(queryTemplate, escapeString(schema))
-			rows, err := db.QueryContext(tctx, query)
-			if err != nil {
-				return nil, errors.Annotatef(err, "sql: %s", query)
-			}
-			results, err := GetSpecifiedColumnValuesAndClose(rows, "NAME", "ENGINE", "AVG_ROW_LENGTH", "COMMENT")
-			if err != nil {
-				return nil, errors.Annotatef(err, "sql: %s", query)
-			}
-			for _, oneRow := range results {
-				table, engine, avgRowLengthStr, comment := oneRow[0], oneRow[1], oneRow[2], oneRow[3]
-				if avgRowLengthStr != "" {
-					avgRowLength, err = strconv.ParseUint(avgRowLengthStr, 10, 64)
-					if err != nil {
-						return nil, errors.Annotatef(err, "sql: %s", query)
-					}
-				} else {
-					avgRowLength = 0
-				}
-				tableType = TableTypeBase
-				if engine == "" && (comment == "" || comment == TableTypeViewStr) {
-					tableType = TableTypeView
-				} else if engine == "" {
-					tctx.L().Warn("invalid table without engine found", zap.String("database", schema), zap.String("table", table))
-					continue
-				}
-				if _, ok := selectedTableType[tableType]; !ok {
-					continue
-				}
-				dbTables[schema] = append(dbTables[schema], &TableInfo{table, avgRowLength, tableType})
-			}
-		}
+	wantType := make(map[TableType]struct{}, len(tableTypes))
+	for _, t := range tableTypes {
+		wantType[t] = struct{}{}
 	}
-	return dbTables, nil
+	const q = `
+SELECT n.nspname,
+       c.relname,
+       CASE c.relkind
+         WHEN 'r' THEN 'BASE TABLE'
+         WHEN 'p' THEN 'BASE TABLE'
+         WHEN 'v' THEN 'VIEW'
+         WHEN 'm' THEN 'VIEW'
+         WHEN 'S' THEN 'SEQUENCE'
+         ELSE 'BASE TABLE'
+       END AS table_type,
+       COALESCE(
+         CASE WHEN c.reltuples > 0
+              THEN (pg_relation_size(c.oid) / c.reltuples)::bigint
+              ELSE 0
+         END, 0) AS avg_row_length
+FROM pg_catalog.pg_class c
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = ANY($1)
+  AND c.relkind = ANY(ARRAY['r','p','v','m'])
+ORDER BY n.nspname, c.relname`
+	rows, err := db.QueryContext(tctx, q, anyStringArray(databaseNames))
+	if err != nil {
+		return nil, errors.Annotatef(err, "sql: %s", q)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var (
+			schema, name, ttype string
+			avgRowLength        sql.NullInt64
+		)
+		if err := rows.Scan(&schema, &name, &ttype, &avgRowLength); err != nil {
+			return nil, errors.Trace(err)
+		}
+		tableType, err := ParseTableType(ttype)
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+		if _, ok := wantType[tableType]; !ok && len(wantType) > 0 {
+			continue
+		}
+		var avg uint64
+		if avgRowLength.Valid {
+			avg = uint64(avgRowLength.Int64)
+		}
+		dbTables[schema] = append(dbTables[schema], &TableInfo{name, avg, tableType})
+	}
+	return dbTables, rows.Err()
 }
 
 // SelectVersion gets the version information from the database server
@@ -470,32 +306,25 @@ func buildSelectQuery(database, table, fields, partition, where, orderByClause s
 	var query strings.Builder
 	query.WriteString("SELECT ")
 	if fields == "" {
-		// If all of the columns are generated,
-		// we need to make sure the query is valid.
 		fields = "''"
 	}
 	query.WriteString(fields)
-	query.WriteString(" FROM `")
-	query.WriteString(escapeString(database))
-	query.WriteString("`.`")
-	query.WriteString(escapeString(table))
-	query.WriteByte('`')
+	query.WriteString(" FROM ")
 	if partition != "" {
-		query.WriteString(" PARTITION(`")
-		query.WriteString(escapeString(partition))
-		query.WriteString("`)")
+		// Postgres declarative partitioning: each partition is a regular table
+		// in the same schema. Reach into it directly.
+		query.WriteString(pgQuoteQName(database, partition))
+	} else {
+		query.WriteString(pgQuoteQName(database, table))
 	}
-
 	if where != "" {
 		query.WriteString(" ")
 		query.WriteString(where)
 	}
-
 	if orderByClause != "" {
 		query.WriteString(" ")
 		query.WriteString(orderByClause)
 	}
-
 	return query.String()
 }
 
@@ -532,7 +361,7 @@ func GetSuitableRows(avgRowLength uint64) uint64 {
 
 // GetColumnTypes gets *sql.ColumnTypes from a specified table
 func GetColumnTypes(tctx *tcontext.Context, db *BaseConn, fields, database, table string) ([]*sql.ColumnType, error) {
-	query := fmt.Sprintf("SELECT %s FROM `%s`.`%s` LIMIT 1", fields, escapeString(database), escapeString(table))
+	query := fmt.Sprintf("SELECT %s FROM %s LIMIT 1", fields, pgQuoteQName(database, table))
 	var colTypes []*sql.ColumnType
 	err := db.QuerySQL(tctx, func(rows *sql.Rows) error {
 		var err error
@@ -571,89 +400,35 @@ func GetPrimaryKeyAndColumnTypes(tctx *tcontext.Context, conn *BaseConn, meta Ta
 	return colNames, colTypes, nil
 }
 
-// GetPrimaryKeyColumns gets all primary columns in ordinal order
+// GetPrimaryKeyColumns gets all primary key columns in ordinal order.
 func GetPrimaryKeyColumns(tctx *tcontext.Context, db *BaseConn, database, table string) ([]string, error) {
-	priKeyColsQuery := fmt.Sprintf("SHOW INDEX FROM `%s`.`%s`", escapeString(database), escapeString(table))
-	results, err := db.QuerySQLWithColumns(tctx, []string{"KEY_NAME", "COLUMN_NAME"}, priKeyColsQuery)
+	const q = `
+SELECT a.attname
+FROM pg_catalog.pg_index i
+JOIN pg_catalog.pg_class c ON c.oid = i.indrelid
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid
+                              AND a.attnum = ANY(i.indkey)
+WHERE i.indisprimary
+  AND n.nspname = $1
+  AND c.relname = $2
+ORDER BY array_position(i.indkey, a.attnum)`
+	results, err := db.QuerySQLWithColumns(tctx, []string{"attname"}, q, database, table)
 	if err != nil {
 		return nil, err
 	}
-
 	cols := make([]string, 0, len(results))
 	for _, oneRow := range results {
-		keyName, columnName := oneRow[0], oneRow[1]
-		if keyName == "PRIMARY" {
-			cols = append(cols, columnName)
-		}
+		cols = append(cols, oneRow[0])
 	}
 	return cols, nil
 }
 
-// getNumericIndex picks up indices according to the following priority:
-// primary key > unique key with the smallest count > key with the max cardinality
-// primary key with multi cols is before unique key with single col because we will sort result by primary keys
-func getNumericIndex(tctx *tcontext.Context, db *BaseConn, meta TableMeta) (string, error) {
-	database, table := meta.DatabaseName(), meta.TableName()
-	colName2Type := string2Map(meta.ColumnNames(), meta.ColumnTypes())
-	keyQuery := fmt.Sprintf("SHOW INDEX FROM `%s`.`%s`", escapeString(database), escapeString(table))
-	results, err := db.QuerySQLWithColumns(tctx, []string{"NON_UNIQUE", "SEQ_IN_INDEX", "KEY_NAME", "COLUMN_NAME", "CARDINALITY"}, keyQuery)
-	if err != nil {
-		return "", err
-	}
-	type keyColumnPair struct {
-		colName string
-		count   uint64
-	}
-	var (
-		uniqueKeyMap   = map[string]keyColumnPair{} // unique key name -> key column name, unique key columns count
-		keyColumn      string
-		maxCardinality int64 = -1
-	)
-
-	// check primary key first, then unique key
-	for _, oneRow := range results {
-		nonUnique, seqInIndex, keyName, colName, cardinality := oneRow[0], oneRow[1], oneRow[2], oneRow[3], oneRow[4]
-		// only try pick the first column, because the second column of pk/uk in where condition will trigger a full table scan
-		if seqInIndex != "1" {
-			if pair, ok := uniqueKeyMap[keyName]; ok {
-				seqInIndexInt, err := strconv.ParseUint(seqInIndex, 10, 64)
-				if err == nil && seqInIndexInt > pair.count {
-					uniqueKeyMap[keyName] = keyColumnPair{pair.colName, seqInIndexInt}
-				}
-			}
-			continue
-		}
-		_, numberColumn := dataTypeInt[colName2Type[colName]]
-		if numberColumn {
-			switch {
-			case keyName == "PRIMARY":
-				return colName, nil
-			case nonUnique == "0":
-				uniqueKeyMap[keyName] = keyColumnPair{colName, 1}
-			// pick index column with max cardinality when there is no unique index
-			case len(uniqueKeyMap) == 0:
-				cardinalityInt, err := strconv.ParseInt(cardinality, 10, 64)
-				if err == nil && cardinalityInt > maxCardinality {
-					keyColumn = colName
-					maxCardinality = cardinalityInt
-				}
-			}
-		}
-	}
-	if len(uniqueKeyMap) > 0 {
-		var (
-			minCols         uint64 = math.MaxUint64
-			uniqueKeyColumn string
-		)
-		for _, pair := range uniqueKeyMap {
-			if pair.count < minCols {
-				uniqueKeyColumn = pair.colName
-				minCols = pair.count
-			}
-		}
-		return uniqueKeyColumn, nil
-	}
-	return keyColumn, nil
+// getNumericIndex picks an integer-typed column from PRIMARY/unique indexes
+// for use as a chunking key. Phase 1 returns "" so callers fall back to
+// sequential dumping. Phase 2 will revive ctid- or PK-range chunking.
+func getNumericIndex(_ *tcontext.Context, _ *BaseConn, _ TableMeta) (string, error) {
+	return "", nil
 }
 
 // GetSpecifiedColumnValueAndClose get columns' values whose name is equal to columnName and close the given rows
@@ -777,48 +552,60 @@ func resetDBWithSessionParams(tctx *tcontext.Context, db *sql.DB, dsn string, pa
 	return newDB, nil
 }
 
+// createConnWithConsistency opens a worker connection and starts it inside
+// a REPEATABLE READ READ ONLY transaction. If pgSnapshotToken is non-empty
+// the connection is bound to that exported snapshot so all worker
+// connections observe the same MVCC view.
+//
+// The repeatableRead flag is kept for API compatibility; in PG mode we
+// always begin a REPEATABLE READ transaction when consistency != none.
+var pgSnapshotToken string
+
 func createConnWithConsistency(ctx context.Context, db *sql.DB, repeatableRead bool) (*sql.Conn, error) {
 	conn, err := db.Conn(ctx)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
-	var query string
-	if repeatableRead {
-		query = "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ"
-		_, err = conn.ExecContext(ctx, query)
-		if err != nil {
-			return nil, errors.Annotatef(err, "sql: %s", query)
-		}
+	if !repeatableRead {
+		return conn, nil
 	}
-	query = "START TRANSACTION /*!40108 WITH CONSISTENT SNAPSHOT */"
-	_, err = conn.ExecContext(ctx, query)
-	if err != nil {
-		// Some MySQL Compatible databases like Vitess and MemSQL/SingleStore
-		// are newer than 4.1.8 (the version comment) but don't actually support
-		// `WITH CONSISTENT SNAPSHOT`. So retry without that if the statement fails.
-		query = "START TRANSACTION"
-		_, err = conn.ExecContext(ctx, query)
-		if err != nil {
-			return nil, errors.Annotatef(err, "sql: %s", query)
+	begin := "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY"
+	if _, err = conn.ExecContext(ctx, begin); err != nil {
+		return nil, errors.Annotatef(err, "sql: %s", begin)
+	}
+	if pgSnapshotToken != "" {
+		set := "SET TRANSACTION SNAPSHOT '" + escapeStringLiteral(pgSnapshotToken) + "'"
+		if _, err = conn.ExecContext(ctx, set); err != nil {
+			return nil, errors.Annotatef(err, "sql: %s", set)
 		}
 	}
 	return conn, nil
 }
 
-// buildSelectField returns the selecting fields' string(joined by comma(`,`)),
-// and the number of writable fields.
-func buildSelectField(tctx *tcontext.Context, db *BaseConn, dbName, tableName string, completeInsert bool) (string, int, error) { // revive:disable-line:flag-parameter
-	query := fmt.Sprintf("SHOW COLUMNS FROM `%s`.`%s`", escapeString(dbName), escapeString(tableName))
-	results, err := db.QuerySQLWithColumns(tctx, []string{"FIELD", "EXTRA"}, query)
+// SetPgSnapshotToken records the token (from pg_export_snapshot()) that
+// future worker connections opened via createConnWithConsistency should
+// adopt with SET TRANSACTION SNAPSHOT.
+func SetPgSnapshotToken(token string) { pgSnapshotToken = token }
+
+// buildSelectField returns the selecting fields' string (comma-joined) and
+// the number of writable columns. Reads from information_schema.columns and
+// drops STORED/ALWAYS GENERATED columns from the projection so the dumped
+// INSERT statements remain valid on reload.
+func buildSelectField(tctx *tcontext.Context, db *BaseConn, dbName, tableName string, completeInsert bool) (string, int, error) {
+	const q = `
+SELECT column_name, is_generated
+FROM information_schema.columns
+WHERE table_schema = $1 AND table_name = $2
+ORDER BY ordinal_position`
+	results, err := db.QuerySQLWithColumns(tctx, []string{"column_name", "is_generated"}, q, dbName, tableName)
 	if err != nil {
 		return "", 0, err
 	}
-	availableFields := make([]string, 0)
+	availableFields := make([]string, 0, len(results))
 	hasGenerateColumn := false
 	for _, oneRow := range results {
-		fieldName, extra := oneRow[0], oneRow[1]
-		switch extra {
-		case "STORED GENERATED", "VIRTUAL GENERATED":
+		fieldName, isGen := oneRow[0], oneRow[1]
+		if isGen == "ALWAYS" {
 			hasGenerateColumn = true
 			continue
 		}
@@ -836,7 +623,7 @@ func buildWhereClauses(handleColNames []string, handleVals [][]string) []string 
 	}
 	quotaCols := make([]string, len(handleColNames))
 	for i, s := range handleColNames {
-		quotaCols[i] = fmt.Sprintf("`%s`", escapeString(s))
+		quotaCols[i] = pgQuoteIdent(s)
 	}
 	where := make([]string, 0, len(handleVals)+1)
 	buf := &bytes.Buffer{}
@@ -965,12 +752,11 @@ func buildOrderByClauseString(handleColNames []string) string {
 	if len(handleColNames) == 0 {
 		return ""
 	}
-	separator := ","
 	quotaCols := make([]string, len(handleColNames))
 	for i, col := range handleColNames {
-		quotaCols[i] = fmt.Sprintf("`%s`", escapeString(col))
+		quotaCols[i] = pgQuoteIdent(col)
 	}
-	return fmt.Sprintf("ORDER BY %s", strings.Join(quotaCols, separator))
+	return fmt.Sprintf("ORDER BY %s", strings.Join(quotaCols, ","))
 }
 
 type oneStrColumnTable struct {
@@ -1031,10 +817,11 @@ func pickupPossibleField(tctx *tcontext.Context, meta TableMeta, db *BaseConn) (
 
 func estimateCount(tctx *tcontext.Context, dbName, tableName string, db *BaseConn, field string, conf *Config) uint64 {
 	var query string
+	qname := pgQuoteQName(dbName, tableName)
 	if strings.TrimSpace(field) == "*" || strings.TrimSpace(field) == "" {
-		query = fmt.Sprintf("EXPLAIN SELECT * FROM `%s`.`%s`", escapeString(dbName), escapeString(tableName))
+		query = fmt.Sprintf("EXPLAIN SELECT * FROM %s", qname)
 	} else {
-		query = fmt.Sprintf("EXPLAIN SELECT `%s` FROM `%s`.`%s`", escapeString(field), escapeString(dbName), escapeString(tableName))
+		query = fmt.Sprintf("EXPLAIN SELECT %s FROM %s", pgQuoteIdent(field), qname)
 	}
 
 	if conf.Where != "" {
@@ -1147,22 +934,29 @@ func escapeString(s string) string {
 	return strings.ReplaceAll(s, "`", "``")
 }
 
-// GetPartitionNames get partition names from a specified table
+// GetPartitionNames returns the child partition tables of a PostgreSQL
+// declarative partitioned table. The result is the partition relation
+// names in the same schema as the parent.
 func GetPartitionNames(tctx *tcontext.Context, db *BaseConn, schema, table string) (partitions []string, err error) {
 	partitions = make([]string, 0)
-	var partitionName sql.NullString
+	const q = `
+SELECT cc.relname
+FROM pg_catalog.pg_inherits i
+JOIN pg_catalog.pg_class p  ON p.oid  = i.inhparent
+JOIN pg_catalog.pg_namespace pn ON pn.oid = p.relnamespace
+JOIN pg_catalog.pg_class cc ON cc.oid = i.inhrelid
+WHERE pn.nspname = $1 AND p.relname = $2
+ORDER BY cc.relname`
 	err = db.QuerySQL(tctx, func(rows *sql.Rows) error {
-		err := rows.Scan(&partitionName)
-		if err != nil {
+		var name string
+		if err := rows.Scan(&name); err != nil {
 			return errors.Trace(err)
 		}
-		if partitionName.Valid {
-			partitions = append(partitions, partitionName.String)
-		}
+		partitions = append(partitions, name)
 		return nil
 	}, func() {
 		partitions = partitions[:0]
-	}, "SELECT PARTITION_NAME from INFORMATION_SCHEMA.PARTITIONS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?", schema, table)
+	}, q, schema, table)
 	return
 }
 
