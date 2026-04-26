@@ -17,15 +17,14 @@ Status
   binary connects via `pgx`, queries `pg_catalog`, snapshots via
   `pg_export_snapshot()`, shells out to `pg_dump --schema-only` for DDL,
   and writes per-table data files in dumpling's chunked layout.
-- **Phase 2** (in progress) — PG → MySQL/TiDB migration via
-  intermediate formats. CSV hardening (PG-specific types via
-  server-side casts) and Parquet output (`--filetype parquet`) are the
-  primary deliverables; downstream loaders (TiDB Lightning, etc.)
-  consume them. Direct MySQL-loadable SQL output is **not** pursued —
+- **Phase 2** (in progress) — PG → MySQL/TiDB migration via CSV.
+  Hardening of the CSV path so that PG-specific types (timestamptz,
+  bytea, uuid, jsonb, arrays, ranges, enum, interval, inet) are
+  emitted in a form TiDB Lightning can ingest, plus revival of
+  table-internal chunking and removal of the local TiDB `replace`
+  directive. Direct MySQL-loadable SQL output is **not** pursued —
   the PG/MySQL incompatibility surface is too wide for SQL-level
-  translation. Table-internal chunking and removal of the local TiDB
-  `replace` directive are also in Phase 2. See
-  `worklog/04-phase2-roadmap.md`.
+  translation. See `worklog/04-phase2-roadmap.md`.
 
 What gets dumped
 ----------------
@@ -109,8 +108,8 @@ Phase 2 plan is:
 1. Translate the `-schema.sql` files (PG DDL) into MySQL/TiDB DDL
    yourself or via an LLM, then run them on the target.
 2. Re-run pg-dumpling with `--filetype csv` (Phase 2 hardens this for
-   PG-specific types) or `--filetype parquet` (Phase 2 adds this) and
-   feed the resulting files to TiDB Lightning.
+   PG-specific types via server-side casts) and feed the resulting
+   files to TiDB Lightning.
 
 See `worklog/04-phase2-roadmap.md` for the type-cast matrix and the
 implementation roadmap.
@@ -126,7 +125,7 @@ Flag highlights
 -B --database       database name (PGDATABASE for the connection)
 -o --output         output directory
 -t --threads        worker count
-   --filetype       sql | csv (Phase 2 will add: parquet)
+   --filetype       sql | csv
    --consistency    auto | snapshot | none
    --snapshot       reuse a pg_export_snapshot() token
 -f --filter         table filter glob, e.g. "public.*" or "!pg_catalog.*"

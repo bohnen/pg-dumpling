@@ -19,7 +19,7 @@ TiDB のデータ移行ツール**として使えるようにすること。
 | `v0.1.0-baseline` | ✅ | TiDB monorepo から切り出した素の dumpling |
 | `v0.2.0-strip-consistency` | ✅ | consistency lock/flush 削除、テスト一掃 |
 | `v0.3.0-postgres` | ✅ | PG 用 catalog / driver / dialect、bin/pg-dumpling リネーム、Docker round-trip 成功 |
-| Phase 2(進行中) | 🚧 | **中間フォーマット**経由の PG → TiDB 移行: CSV ハードニング、Parquet 出力、テーブル内 chunk、`replace` 解消 |
+| Phase 2(進行中) | 🚧 | **中間フォーマット**経由の PG → TiDB 移行: CSV ハードニング、テーブル内 chunk、`replace` 解消 |
 
 ## ビルド & テスト
 
@@ -82,8 +82,9 @@ skip して `SET` だけ流す)。
 - **重要**: この SQL モード出力は PG 専用(同じ PG クラスタへの round-trip
   検証用)。MySQL/TiDB に取り込もうとすると `Unknown system variable
   'standard_conforming_strings'` で弾かれる。
-- Phase 2 では SQL 互換出力は追わず、**CSV / Parquet を中間フォーマット**として
-  整備し、TiDB Lightning 等のローダ経由で TiDB / MySQL へ流す。
+- Phase 2 では SQL 互換出力は追わず、**CSV を中間フォーマット**として整備し、
+  TiDB Lightning 等のローダ経由で TiDB / MySQL へ流す。Parquet は上流 dumpling
+  にも無いため Phase 3 以降で要否を再検討。
 
 ### Postgres と MySQL の型ギャップ
 
@@ -138,14 +139,13 @@ Phase 1 末で完全削除:
 1. **CSV ハードニング** — PG 固有型(timestamptz / bytea / uuid / json /
    配列 / range / enum / interval / inet 系)をサーバ側 cast で安全な文字列にして
    出力。`--csv-binary-format`、bool の 0/1 化等のオプション追加
-2. **Parquet 出力** — `--filetype parquet`。`information_schema.columns` から
-   Parquet schema を導出、`apache/arrow-go` を使ってストリーミング書き出し
-3. **テーブル内 chunk** — 数値 PK レンジ → `ctid` レンジ → partition fan-out
-4. **`replace ~/Work/tidb` の解消** — 残った 5 パッケージを `internal/` 取り込み
-5. **ドキュメント整備と `v0.4.0` リリース**
+2. **テーブル内 chunk** — 数値 PK レンジ → `ctid` レンジ → partition fan-out
+3. **`replace ~/Work/tidb` の解消** — 残った 5 パッケージを `internal/` 取り込み
+4. **ドキュメント整備と `v0.4.0` リリース**
 
-CI(GitHub Actions)、PostGIS / hstore / tsvector の特殊型対応は Phase 3 へ送る。
-MySQL 互換 SQL 出力モード(`--target=mysql/tidb` フラグ)は **採用しない**。
+CI(GitHub Actions)、Parquet 出力、PostGIS / hstore / tsvector の特殊型対応は
+Phase 3 以降へ送る。MySQL 互換 SQL 出力モード(`--target=mysql/tidb` フラグ)は
+**採用しない**。
 
 ## 作業のお作法
 
