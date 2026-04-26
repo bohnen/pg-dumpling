@@ -16,9 +16,7 @@ import (
 
 	"github.com/coreos/go-semver/semver"
 	"github.com/docker/go-units"
-	"github.com/go-sql-driver/mysql"
 	"github.com/pingcap/errors"
-	"github.com/pingcap/failpoint"
 	"github.com/pingcap/tidb/br/pkg/storage"
 	"github.com/pingcap/tidb/br/pkg/version"
 	"github.com/pingcap/tidb/pkg/util"
@@ -143,6 +141,7 @@ type Config struct {
 	Password string `json:"-"`
 	Security struct {
 		TLS          *tls.Config `json:"-"`
+		SSLMode      string
 		CAPath       string
 		CertPath     string
 		KeyPath      string
@@ -254,50 +253,71 @@ func (conf *Config) String() string {
 	return string(cfg)
 }
 
-// GetDriverConfig returns the MySQL driver config from Config.
-func (conf *Config) GetDriverConfig(db string) *mysql.Config {
-	driverCfg := mysql.NewConfig()
-	// maxAllowedPacket=0 can be used to automatically fetch the max_allowed_packet variable from server on every connection.
-	// https://github.com/go-sql-driver/mysql#maxallowedpacket
-	hostPort := net.JoinHostPort(conf.Host, strconv.Itoa(conf.Port))
-	driverCfg.User = conf.User
-	driverCfg.Passwd = conf.Password
-	driverCfg.Net = "tcp"
-	if conf.Net != "" {
-		driverCfg.Net = conf.Net
+// GetDSN returns a PostgreSQL DSN string for use with the pgx stdlib driver.
+// If db is empty, the database name from Config is used (or omitted entirely
+// to fall back to the user's default database).
+func (conf *Config) GetDSN(db string) string {
+	if db == "" && len(conf.Databases) > 0 {
+		db = conf.Databases[0]
 	}
-	driverCfg.Addr = hostPort
-	driverCfg.DBName = db
-	driverCfg.Collation = "utf8mb4_general_ci"
-	driverCfg.ReadTimeout = conf.ReadTimeout
-	driverCfg.WriteTimeout = 30 * time.Second
-	driverCfg.InterpolateParams = true
-	driverCfg.MaxAllowedPacket = 0
-	if conf.Security.TLS != nil {
-		driverCfg.TLS = conf.Security.TLS
-	} else {
-		// Use TLS first.
-		driverCfg.AllowFallbackToPlaintext = true
-		minTLSVersion := uint16(tls.VersionTLS12)
-		if conf.MinTLSVersion != 0 {
-			minTLSVersion = conf.MinTLSVersion
-		}
-		/* #nosec G402 */
-		driverCfg.TLS = &tls.Config{
-			InsecureSkipVerify: true,
-			MinVersion:         minTLSVersion,
-			NextProtos:         []string{"h2", "http/1.1"}, // specify `h2` to let Go use HTTP/2.
-		}
+	var b strings.Builder
+	b.WriteString("postgres://")
+	if conf.User != "" {
+		b.WriteString(urlUserPass(conf.User, conf.Password))
+		b.WriteString("@")
 	}
-	if conf.AllowCleartextPasswords {
-		driverCfg.AllowCleartextPasswords = true
+	b.WriteString(net.JoinHostPort(conf.Host, strconv.Itoa(conf.Port)))
+	if db != "" {
+		b.WriteString("/")
+		b.WriteString(db)
 	}
-	failpoint.Inject("SetWaitTimeout", func(val failpoint.Value) {
-		driverCfg.Params = map[string]string{
-			"wait_timeout": strconv.Itoa(val.(int)),
+	q := []string{}
+	if conf.Security.SSLMode != "" {
+		q = append(q, "sslmode="+conf.Security.SSLMode)
+	} else if conf.Security.CAPath == "" && conf.Security.CertPath == "" {
+		// no TLS material configured: prefer but don't require TLS
+		q = append(q, "sslmode=prefer")
+	}
+	if conf.Security.CAPath != "" {
+		q = append(q, "sslrootcert="+conf.Security.CAPath)
+	}
+	if conf.Security.CertPath != "" {
+		q = append(q, "sslcert="+conf.Security.CertPath)
+	}
+	if conf.Security.KeyPath != "" {
+		q = append(q, "sslkey="+conf.Security.KeyPath)
+	}
+	if conf.ReadTimeout > 0 {
+		q = append(q, fmt.Sprintf("statement_timeout=%d", int(conf.ReadTimeout/time.Millisecond)))
+	}
+	if len(q) > 0 {
+		b.WriteString("?")
+		b.WriteString(strings.Join(q, "&"))
+	}
+	return b.String()
+}
+
+// urlUserPass URL-escapes a user and (optional) password for inclusion in a
+// postgres:// DSN. Values are escaped according to RFC 3986 userinfo rules.
+func urlUserPass(user, pass string) string {
+	if pass == "" {
+		return urlEscape(user)
+	}
+	return urlEscape(user) + ":" + urlEscape(pass)
+}
+
+func urlEscape(s string) string {
+	const safe = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~"
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if strings.IndexByte(safe, c) >= 0 {
+			b.WriteByte(c)
+			continue
 		}
-	})
-	return driverCfg
+		fmt.Fprintf(&b, "%%%02X", c)
+	}
+	return b.String()
 }
 
 func timestampDirName() string {
@@ -311,7 +331,7 @@ func (*Config) DefineFlags(flags *pflag.FlagSet) {
 	flags.StringSliceP(flagTablesList, "T", nil, "Comma delimited table list to dump; must be qualified table names")
 	flags.StringP(flagHost, "h", "127.0.0.1", "The host to connect to")
 	flags.StringP(flagUser, "u", "root", "Username with privileges to run the dump")
-	flags.IntP(flagPort, "P", 4000, "TCP/IP port to connect to")
+	flags.IntP(flagPort, "P", 5432, "TCP/IP port to connect to")
 	flags.StringP(flagPassword, "p", "", "User password")
 	flags.Bool(flagAllowCleartextPasswords, false, "Allow passwords to be sent in cleartext (warning: don't use without TLS)")
 	flags.IntP(flagThreads, "t", 4, "Number of goroutines to use, default 4")

@@ -8,19 +8,17 @@ import (
 	"database/sql/driver"
 	"fmt"
 	"math/big"
-	"net"
 	"sync/atomic"
 	"time"
 
-	// import mysql driver
-	"github.com/go-sql-driver/mysql"
 	"github.com/google/uuid"
+	// register pgx as the database/sql driver
+	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/pingcap/errors"
 	"github.com/pingcap/failpoint"
 	pclog "github.com/pingcap/log"
 	"github.com/pingcap/tidb/br/pkg/storage"
 	"github.com/pingcap/tidb/br/pkg/summary"
-	"github.com/pingcap/tidb/pkg/util"
 	"github.com/tadapin/pg-dumpling/cli"
 	tcontext "github.com/tadapin/pg-dumpling/context"
 	"github.com/tadapin/pg-dumpling/log"
@@ -29,7 +27,6 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-var openDBFunc = openDB
 
 // Dumper is the dump progress structure
 type Dumper struct {
@@ -801,28 +798,12 @@ func startHTTPService(d *Dumper) error {
 
 // openSQLDB is an initialization step of Dumper.
 func openSQLDB(d *Dumper) error {
-	if d.conf.IOTotalBytes != nil {
-		mysql.RegisterDialContext(d.conf.Net, func(ctx context.Context, addr string) (net.Conn, error) {
-			dial := &net.Dialer{}
-			conn, err := dial.DialContext(ctx, "tcp", addr)
-			if err != nil {
-				return nil, err
-			}
-			tcpConn := conn.(*net.TCPConn)
-			// try https://github.com/go-sql-driver/mysql/blob/bcc459a906419e2890a50fc2c99ea6dd927a88f2/connector.go#L56-L64
-			err = tcpConn.SetKeepAlive(true)
-			if err != nil {
-				d.tctx.L().Logger.Warn("fail to keep alive", zap.Error(err))
-			}
-			return util.NewTCPConnWithIOCounter(tcpConn, d.conf.IOTotalBytes), nil
-		})
-	}
 	conf := d.conf
-	c, err := mysql.NewConnector(conf.GetDriverConfig(""))
+	db, err := sql.Open("pgx", conf.GetDSN(""))
 	if err != nil {
 		return errors.Trace(err)
 	}
-	d.dbHandle = sql.OpenDB(c)
+	d.dbHandle = db
 	return nil
 }
 
@@ -846,19 +827,12 @@ func validateResolveAutoConsistency(d *Dumper) error {
 func setSessionParam(d *Dumper) error {
 	conf, pool := d.conf, d.dbHandle
 	var err error
-	if d.dbHandle, err = resetDBWithSessionParams(d.tctx, pool, conf.GetDriverConfig(""), conf.SessionParams); err != nil {
+	if d.dbHandle, err = resetDBWithSessionParams(d.tctx, pool, conf.GetDSN(""), conf.SessionParams); err != nil {
 		return errors.Trace(err)
 	}
 	return nil
 }
 
-func openDB(cfg *mysql.Config) (*sql.DB, error) {
-	c, err := mysql.NewConnector(cfg)
-	if err != nil {
-		return nil, errors.Trace(err)
-	}
-	return sql.OpenDB(c), nil
-}
 
 
 func (d *Dumper) newTaskTableData(meta TableMeta, data TableDataIR, currentChunk, totalChunks int) *TaskTableData {

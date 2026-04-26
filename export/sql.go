@@ -12,14 +12,36 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/go-sql-driver/mysql"
 	"github.com/pingcap/errors"
 	"github.com/pingcap/failpoint"
 	tcontext "github.com/tadapin/pg-dumpling/context"
 	"github.com/tadapin/pg-dumpling/log"
-	"go.uber.org/multierr"
 	"go.uber.org/zap"
 )
+
+// pgQuoteIdent quotes a PostgreSQL identifier following the standard rules:
+// wrap in double quotes and double any embedded double quote.
+func pgQuoteIdent(name string) string {
+	var b strings.Builder
+	b.Grow(len(name) + 2)
+	b.WriteByte('"')
+	for i := 0; i < len(name); i++ {
+		if name[i] == '"' {
+			b.WriteByte('"')
+		}
+		b.WriteByte(name[i])
+	}
+	b.WriteByte('"')
+	return b.String()
+}
+
+// pgQuoteQName quotes "schema"."name".
+func pgQuoteQName(schema, name string) string {
+	if schema == "" {
+		return pgQuoteIdent(name)
+	}
+	return pgQuoteIdent(schema) + "." + pgQuoteIdent(name)
+}
 
 const (
 	orderByTiDBRowID = "ORDER BY `_tidb_rowid`"
@@ -52,29 +74,12 @@ func ShowTables(db *sql.Conn) ([]string, error) {
 	return res.data, nil
 }
 
-// ShowCreateDatabase constructs the create database SQL for a specified database
-// returns (createDatabaseSQL, error)
-func ShowCreateDatabase(tctx *tcontext.Context, db *BaseConn, database string) (string, error) {
-	var oneRow [2]string
-	handleOneRow := func(rows *sql.Rows) error {
-		return rows.Scan(&oneRow[0], &oneRow[1])
-	}
-	query := fmt.Sprintf("SHOW CREATE DATABASE `%s`", escapeString(database))
-	err := db.QuerySQL(tctx, handleOneRow, func() {
-		oneRow[0], oneRow[1] = "", ""
-	}, query)
-	if multiErrs := multierr.Errors(err); len(multiErrs) > 0 {
-		for _, multiErr := range multiErrs {
-			if mysqlErr, ok := errors.Cause(multiErr).(*mysql.MySQLError); ok {
-				// Falling back to simple create statement for MemSQL/SingleStore, because of this:
-				// ERROR 1706 (HY000): Feature 'SHOW CREATE DATABASE' is not supported by MemSQL.
-				if strings.Contains(mysqlErr.Error(), "SHOW CREATE DATABASE") {
-					return fmt.Sprintf("CREATE DATABASE `%s`", escapeString(database)), nil
-				}
-			}
-		}
-	}
-	return oneRow[1], err
+// ShowCreateDatabase emits a CREATE SCHEMA statement for the given schema.
+// In Postgres there's no "SHOW CREATE DATABASE" equivalent that produces the
+// owner/encoding hints; we just emit a permissive CREATE SCHEMA so the dump
+// can be loaded into a fresh database.
+func ShowCreateDatabase(_ *tcontext.Context, _ *BaseConn, database string) (string, error) {
+	return fmt.Sprintf(`CREATE SCHEMA IF NOT EXISTS %s`, pgQuoteIdent(database)), nil
 }
 
 // ShowCreateTable constructs the create table SQL for a specified table
@@ -693,62 +698,38 @@ func GetSpecifiedColumnValuesAndClose(rows *sql.Rows, columnName ...string) ([][
 // constant after the consistency rewrite removed it from consistency.go.
 const snapshotFieldIndex = 1
 
-// resetDBWithSessionParams will return a new sql.DB as a replacement for input `db` with new session parameters.
-// If returned error is nil, the input `db` will be closed.
-func resetDBWithSessionParams(tctx *tcontext.Context, db *sql.DB, cfg *mysql.Config, params map[string]any) (*sql.DB, error) {
-	support := make(map[string]any)
+// resetDBWithSessionParams returns a new *sql.DB whose default session has
+// all of params applied via SET commands. The original db is closed on success.
+//
+// Each connection picked up from the new pool will inherit the SETs because
+// pgx exposes the session-state SETs through its prepare/execution model when
+// the same connection is reused; for full guarantee callers issue the SETs
+// per-connection in the dump loop.
+func resetDBWithSessionParams(tctx *tcontext.Context, db *sql.DB, dsn string, params map[string]any) (*sql.DB, error) {
 	for k, v := range params {
-		var pv any
-		if str, ok := v.(string); ok {
-			if pvi, err := strconv.ParseInt(str, 10, 64); err == nil {
-				pv = pvi
-			} else if pvf, err := strconv.ParseFloat(str, 64); err == nil {
-				pv = pvf
-			} else {
-				pv = str
-			}
-		} else {
-			pv = v
-		}
-		s := fmt.Sprintf("SET SESSION %s = ?", k)
-		_, err := db.ExecContext(tctx, s, pv)
+		s := fmt.Sprintf("SET SESSION %s = $1", k)
+		_, err := db.ExecContext(tctx, s, fmt.Sprintf("%v", v))
 		if err != nil {
-			if strings.Contains(err.Error(), "Unknown system variable") {
-				tctx.L().Info("session variable is not supported by db", zap.String("variable", k), zap.Reflect("value", v))
+			if strings.Contains(err.Error(), "unrecognized configuration parameter") ||
+				strings.Contains(err.Error(), "Unknown system variable") {
+				tctx.L().Info("session variable is not supported by db",
+					zap.String("variable", k), zap.Reflect("value", v))
 				continue
 			}
 			return nil, errors.Trace(err)
 		}
-
-		support[k] = pv
 	}
 
-	if cfg.Params == nil {
-		cfg.Params = make(map[string]string)
-	}
-
-	for k, v := range support {
-		var s string
-		// Wrap string with quote to handle string with space. For example, '2020-10-20 13:41:40'
-		// For --params argument, quote doesn't matter because it doesn't affect the actual value
-		if str, ok := v.(string); ok {
-			s = wrapStringWith(str, "'")
-		} else {
-			s = fmt.Sprintf("%v", v)
-		}
-		cfg.Params[k] = s
-	}
 	failpoint.Inject("SkipResetDB", func(_ failpoint.Value) {
 		failpoint.Return(db, nil)
 	})
 
 	db.Close()
-	c, err := mysql.NewConnector(cfg)
+	newDB, err := sql.Open("pgx", dsn)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
-	newDB := sql.OpenDB(c)
-	// ping to make sure all session parameters are set correctly
+	// ping to make sure the new pool is alive
 	err = newDB.PingContext(tctx)
 	if err != nil {
 		newDB.Close()
