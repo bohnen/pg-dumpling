@@ -192,13 +192,44 @@ README に変換ガイド・プロンプト例を載せるのが Phase 2 の doc
 
 ## ローダ側の TIPS
 
-CSV 取込時に TiDB Lightning / `LOAD DATA INFILE` で:
+### bytea を BLOB / VARBINARY に復元する(最重要)
 
-- `IGNORE 1 LINES` でヘッダ行をスキップ(`--no-header` 無しの既定出力に対応)
-- bytea 列は MySQL 側で `BINARY(...)` / `VARBINARY` / `BLOB` を選び、CSV の
-  16 進文字列を `UNHEX(@col)` で復元する `SET col = UNHEX(@col)` 句を併用
-- 時刻列は `STR_TO_DATE(@col, '%Y-%m-%d %H:%i:%s.%f')` を `SET` で噛ませる選択肢も
-  あるが、上述の cast を入れていれば `DATETIME(6)` への直接 INSERT で済む
+`LOAD DATA INFILE` は CSV セルから直接 BLOB / VARBINARY にバイナリを流せない
+(値に改行・引用符・NULL バイトが含まれているとフィールド/レコード境界が壊れる)。
+pg-dumpling は PG 側で `encode(col, 'hex')` を呼んで **ASCII セーフな 16 進文字列**
+として CSV に書き出すので、ローダ側で **`@var` 経由 + `SET = UNHEX(@var)`** で
+逆変換するのが標準。
+
+```sql
+LOAD DATA LOCAL INFILE '/path/public.bin_test.000000000.csv'
+INTO TABLE bin_test
+FIELDS TERMINATED BY ',' OPTIONALLY ENCLOSED BY '"' LINES TERMINATED BY '\r\n'
+IGNORE 1 LINES
+(id, @small, @many, @empty, @null_)
+SET small_bin = UNHEX(@small),
+    many_bin  = UNHEX(@many),
+    empty_bin = UNHEX(@empty),
+    null_bin  = UNHEX(@null_);
+```
+
+NULL は `\N` のまま素通りする(`UNHEX(NULL) = NULL`)。空 bytea は 0 バイトの
+BLOB として復元される。改行(`0x0A`)・引用符(`0x22`)・バックスラッシュ
+(`0x5C`)・NULL バイト(`0x00`)を含む 8 バイトのテストデータでも、TiDB
+v8.5.6 で `HEX()` 確認まで含めて完全復元することを確認済(2026-04-26)。
+
+### その他
+
+- **ヘッダ行**: `IGNORE 1 LINES` でスキップ(`--no-header` 無しが既定)
+- **時刻列**: pg-dumpling 側の cast で `YYYY-MM-DD HH24:MI:SS.US` 形式にして
+  あるので `DATETIME(6)` / `TIMESTAMP(6)` カラムへ直接 INSERT で OK。
+  値が独自形式の場合は `SET ts = STR_TO_DATE(@col, '%Y-%m-%d %H:%i:%s.%f')`
+  を噛ませる選択肢もある
+- **JSON 列**: pg-dumpling は `(col)::text` / `to_jsonb(col)::text` で出力する
+  ので、TiDB の `JSON` 型カラムへ直接 INSERT 可
+- **UUID**: 36 文字文字列で来るので `CHAR(36)` または `VARCHAR(36)` が素直。
+  `BINARY(16)` に詰めたい場合は `SET uid = UNHEX(REPLACE(@uid_str,'-',''))`
+- **pgvector(`vector(N)`)**: `[1.0,2.0,3.0]` の角括弧形式は TiDB の
+  `VECTOR(N)` 型に直接 INSERT 可
 
 ## 非ゴール(Phase 2 ではやらない)
 
