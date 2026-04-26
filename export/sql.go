@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 
@@ -18,6 +20,40 @@ import (
 	"github.com/tadapin/pg-dumpling/log"
 	"go.uber.org/zap"
 )
+
+// pgDumpEnv carries the connection parameters that runPgDumpSchema passes
+// to the spawned pg_dump process. Set once at startup from the dumper's
+// configuration so we don't have to thread *Config into every call site.
+var pgDumpEnv []string
+
+// SetPgDumpEnv is called once during dumper init to record the host/port/
+// user/password/sslmode that the running pg_dump child should use. It is
+// expressed as os.Environ()-style "KEY=VALUE" entries (typically PGHOST,
+// PGPORT, PGUSER, PGPASSWORD, PGSSLMODE).
+func SetPgDumpEnv(env []string) { pgDumpEnv = env }
+
+// runPgDumpSchema invokes `pg_dump --schema-only --no-owner --no-privileges
+// -t schema.table -d database` and returns the captured stdout. If
+// includeView is true the same call returns the DDL for a view (pg_dump
+// happily dumps view definitions when they match -t).
+func runPgDumpSchema(tctx *tcontext.Context, schema, name string, includeView bool) (string, error) {
+	target := fmt.Sprintf("%s.%s", schema, name)
+	args := []string{"--schema-only", "--no-owner", "--no-privileges", "-t", target}
+	cmd := exec.CommandContext(tctx, "pg_dump", args...)
+	cmd.Env = append(append([]string{}, osEnviron()...), pgDumpEnv...)
+	out, err := cmd.Output()
+	if err != nil {
+		if ee, ok := err.(*exec.ExitError); ok {
+			return "", errors.Annotatef(err, "pg_dump %s failed: %s", target, string(ee.Stderr))
+		}
+		return "", errors.Annotatef(err, "pg_dump %s", target)
+	}
+	_ = includeView
+	return string(out), nil
+}
+
+// osEnviron is split out so tests can override it.
+var osEnviron = func() []string { return os.Environ() }
 
 // pgQuoteIdent quotes a PostgreSQL identifier following the standard rules:
 // wrap in double quotes and double any embedded double quote.
@@ -56,19 +92,31 @@ const (
 	listTableByShowTableStatus
 )
 
-// ShowDatabases shows the databases of a database server.
+// ShowDatabases lists the user-visible PostgreSQL schemas. System schemas
+// (pg_catalog, information_schema, pg_toast, pg_temp_*, pg_toast_temp_*) are
+// excluded.
 func ShowDatabases(db *sql.Conn) ([]string, error) {
+	const q = `SELECT nspname FROM pg_catalog.pg_namespace
+		WHERE nspname NOT IN ('pg_catalog','information_schema','pg_toast')
+		  AND nspname NOT LIKE 'pg_temp_%'
+		  AND nspname NOT LIKE 'pg_toast_temp_%'
+		ORDER BY nspname`
 	var res oneStrColumnTable
-	if err := simpleQuery(db, "SHOW DATABASES", res.handleOneRow); err != nil {
+	if err := simpleQuery(db, q, res.handleOneRow); err != nil {
 		return nil, err
 	}
 	return res.data, nil
 }
 
-// ShowTables shows the tables of a database, the caller should use the correct database.
+// ShowTables lists the tables in the user's search_path schemas. Callers
+// usually want ListAllDatabasesTables instead, which scopes by schema.
 func ShowTables(db *sql.Conn) ([]string, error) {
+	const q = `SELECT format('%I.%I', schemaname, tablename) FROM pg_catalog.pg_tables
+		WHERE schemaname NOT IN ('pg_catalog','information_schema','pg_toast')
+		  AND schemaname NOT LIKE 'pg_temp_%'
+		ORDER BY schemaname, tablename`
 	var res oneStrColumnTable
-	if err := simpleQuery(db, "SHOW TABLES", res.handleOneRow); err != nil {
+	if err := simpleQuery(db, q, res.handleOneRow); err != nil {
 		return nil, err
 	}
 	return res.data, nil
@@ -82,21 +130,13 @@ func ShowCreateDatabase(_ *tcontext.Context, _ *BaseConn, database string) (stri
 	return fmt.Sprintf(`CREATE SCHEMA IF NOT EXISTS %s`, pgQuoteIdent(database)), nil
 }
 
-// ShowCreateTable constructs the create table SQL for a specified table
-// returns (createTableSQL, error)
-func ShowCreateTable(tctx *tcontext.Context, db *BaseConn, database, table string) (string, error) {
-	var oneRow [2]string
-	handleOneRow := func(rows *sql.Rows) error {
-		return rows.Scan(&oneRow[0], &oneRow[1])
-	}
-	query := fmt.Sprintf("SHOW CREATE TABLE `%s`.`%s`", escapeString(database), escapeString(table))
-	err := db.QuerySQL(tctx, handleOneRow, func() {
-		oneRow[0], oneRow[1] = "", ""
-	}, query)
-	if err != nil {
-		return "", err
-	}
-	return oneRow[1], nil
+// ShowCreateTable shells out to pg_dump --schema-only to get the DDL for a
+// specific table. Connection parameters are taken from PG-standard env vars
+// (PGHOST, PGPORT, PGUSER, PGPASSWORD, PGDATABASE) or from the conn's DSN
+// when set via SetPgDumpEnv. The tctx is used for cancellation and logging
+// only; the underlying *BaseConn isn't actually queried.
+func ShowCreateTable(tctx *tcontext.Context, _ *BaseConn, database, table string) (string, error) {
+	return runPgDumpSchema(tctx, database, table, false)
 }
 
 // ShowCreateView constructs the create view SQL for a specified view
@@ -782,7 +822,7 @@ func buildSelectField(tctx *tcontext.Context, db *BaseConn, dbName, tableName st
 			hasGenerateColumn = true
 			continue
 		}
-		availableFields = append(availableFields, wrapBackTicks(escapeString(fieldName)))
+		availableFields = append(availableFields, pgQuoteIdent(fieldName))
 	}
 	if completeInsert || hasGenerateColumn {
 		return strings.Join(availableFields, ","), len(availableFields), nil

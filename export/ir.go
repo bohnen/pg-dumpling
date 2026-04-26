@@ -96,7 +96,7 @@ func setTableMetaFromRows(serverType version.ServerType, rows *sql.Rows) (TableM
 		return nil, errors.Trace(err)
 	}
 	for i := range nms {
-		nms[i] = wrapBackTicks(nms[i])
+		nms[i] = pgQuoteIdent(nms[i])
 	}
 	return &tableMeta{
 		colTypes:      tps,

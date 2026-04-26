@@ -212,13 +212,13 @@ func WriteInsert(
 
 	selectedField := meta.SelectedField()
 
-	// if has generated column
+	tableQName := pgQuoteQName(meta.DatabaseName(), meta.TableName())
 	if selectedField != "" && selectedField != "*" {
 		insertStatementPrefix = fmt.Sprintf("INSERT INTO %s (%s) VALUES\n",
-			wrapBackTicks(escapeString(meta.TableName())), selectedField)
+			tableQName, selectedField)
 	} else {
 		insertStatementPrefix = fmt.Sprintf("INSERT INTO %s VALUES\n",
-			wrapBackTicks(escapeString(meta.TableName())))
+			tableQName)
 	}
 	insertStatementPrefixLen := uint64(len(insertStatementPrefix))
 
@@ -579,13 +579,6 @@ func (w *InterceptFileWriter) Write(ctx context.Context, p []byte) (int, error) 
 // Close closes the InterceptFileWriter
 func (w *InterceptFileWriter) Close(ctx context.Context) error {
 	return w.ExternalFileWriter.Close(ctx)
-}
-
-func wrapBackTicks(identifier string) string {
-	if !strings.HasPrefix(identifier, "`") && !strings.HasSuffix(identifier, "`") {
-		return wrapStringWith(identifier, "`")
-	}
-	return identifier
 }
 
 func wrapStringWith(str string, wrapper string) string {
