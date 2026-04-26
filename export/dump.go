@@ -144,7 +144,6 @@ func NewDumper(ctx context.Context, conf *Config) (*Dumper, error) {
 func (d *Dumper) Dump() (dumpErr error) {
 	initColTypeRowReceiverMap()
 	var (
-		conn    *sql.Conn
 		err     error
 		conCtrl ConsistencyController
 	)
@@ -157,19 +156,6 @@ func (d *Dumper) Dump() (dumpErr error) {
 			_ = m.writeGlobalMetaData()
 		}
 	}()
-
-	// for consistency lock, we should get table list at first to generate the lock tables SQL
-	if conf.Consistency == ConsistencyTypeLock {
-		conn, err = createConnWithConsistency(tctx, pool, repeatableRead)
-		if err != nil {
-			return errors.Trace(err)
-		}
-		if err = prepareTableListToDump(tctx, conf, conn); err != nil {
-			_ = conn.Close()
-			return err
-		}
-		_ = conn.Close()
-	}
 
 	conCtrl, err = NewConsistencyController(tctx, conf, pool)
 	if err != nil {
@@ -213,14 +199,8 @@ func (d *Dumper) Dump() (dumpErr error) {
 		}
 	}
 
-	// for other consistencies, we should get table list after consistency is set up and GlobalMetaData is cached
-	if conf.Consistency != ConsistencyTypeLock {
-		if err = prepareTableListToDump(tctx, conf, metaConn); err != nil {
-			return err
-		}
-	}
-	if err = d.renewSelectTableRegionFuncForLowerTiDB(tctx); err != nil {
-		tctx.L().Info("cannot update select table region info for TiDB", log.ShortError(err))
+	if err = prepareTableListToDump(tctx, conf, metaConn); err != nil {
+		return err
 	}
 
 	atomic.StoreInt64(&d.totalTables, int64(calculateTableCount(conf.Tables)))
@@ -272,9 +252,6 @@ func (d *Dumper) Dump() (dumpErr error) {
 	defer tearDownWriters()
 
 	if conf.TransactionalConsistency {
-		if conf.Consistency == ConsistencyTypeFlush || conf.Consistency == ConsistencyTypeLock {
-			tctx.L().Info("All the dumping transactions have started. Start to unlock tables")
-		}
 		if err = conCtrl.TearDown(tctx); err != nil {
 			return errors.Trace(err)
 		}
@@ -1133,16 +1110,7 @@ func extractTiDBRowIDFromDecodedKey(indexField, key string) (string, error) {
 }
 
 func getListTableTypeByConf(conf *Config) listTableType {
-	// use listTableByShowTableStatus by default because it has better performance
-	listType := listTableByShowTableStatus
-	if conf.Consistency == ConsistencyTypeLock {
-		// for consistency lock, we need to build the tables to dump as soon as possible
-		listType = listTableByInfoSchema
-	} else if conf.Consistency == ConsistencyTypeFlush && matchMysqlBugversion(conf.ServerInfo) {
-		// For some buggy versions of mysql, we need a workaround to get a list of table names.
-		listType = listTableByShowFullTables
-	}
-	return listType
+	return listTableByShowTableStatus
 }
 
 func prepareTableListToDump(tctx *tcontext.Context, conf *Config, db *sql.Conn) error {
@@ -1276,9 +1244,7 @@ func (d *Dumper) dumpSQL(tctx *tcontext.Context, metaConn *BaseConn, taskChan ch
 
 func canRebuildConn(consistency string, trxConsistencyOnly bool) bool {
 	switch consistency {
-	case ConsistencyTypeLock, ConsistencyTypeFlush:
-		return !trxConsistencyOnly
-	case ConsistencyTypeSnapshot, ConsistencyTypeNone:
+	case ConsistencyTypeSnapshot, ConsistencyTypeNone, ConsistencyTypeAuto:
 		return true
 	default:
 		return false
@@ -1398,40 +1364,8 @@ func detectServerInfo(d *Dumper) error {
 // resolveAutoConsistency is an initialization step of Dumper.
 func resolveAutoConsistency(d *Dumper) error {
 	conf := d.conf
-	if conf.Consistency != ConsistencyTypeAuto {
-		return nil
-	}
-	switch conf.ServerInfo.ServerType {
-	case version.ServerTypeTiDB:
+	if conf.Consistency == ConsistencyTypeAuto {
 		conf.Consistency = ConsistencyTypeSnapshot
-	case version.ServerTypeMySQL, version.ServerTypeMariaDB:
-		conf.Consistency = ConsistencyTypeFlush
-	default:
-		conf.Consistency = ConsistencyTypeNone
-	}
-
-	if conf.Consistency == ConsistencyTypeFlush {
-		timeout := time.Second * 5
-		ctx, cancel := context.WithTimeout(d.tctx.Context, timeout)
-		defer cancel()
-
-		// probe if upstream has enough privilege to FLUSH TABLE WITH READ LOCK
-		conn, err := d.dbHandle.Conn(ctx)
-		if err != nil {
-			return errors.New("failed to get connection from db pool after 5 seconds")
-		}
-		//nolint: errcheck
-		defer conn.Close()
-
-		err = FlushTableWithReadLock(d.tctx, conn)
-		//nolint: errcheck
-		defer UnlockTables(d.tctx, conn)
-		if err != nil {
-			// fallback to ConsistencyTypeLock
-			d.tctx.L().Warn("error when use FLUSH TABLE WITH READ LOCK, fallback to LOCK TABLES",
-				zap.Error(err))
-			conf.Consistency = ConsistencyTypeLock
-		}
 	}
 	return nil
 }

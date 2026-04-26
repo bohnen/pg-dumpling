@@ -941,6 +941,11 @@ func CheckTiDBEnableTableLock(db *sql.Conn) (bool, error) {
 	return tidbConfig.EnableTableLock, nil
 }
 
+// snapshotFieldIndex is the column index of the snapshot field in
+// "SHOW MASTER STATUS" / "SHOW BINARY LOG STATUS" output. Retained as a local
+// constant after the consistency rewrite removed it from consistency.go.
+const snapshotFieldIndex = 1
+
 func getSnapshot(db *sql.Conn) (string, error) {
 	serverInfo := version.ServerInfo{
 		ServerType: version.ServerTypeTiDB,
