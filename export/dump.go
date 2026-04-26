@@ -12,7 +12,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/coreos/go-semver/semver"
 	// import mysql driver
 	"github.com/go-sql-driver/mysql"
 	"github.com/google/uuid"
@@ -21,7 +20,6 @@ import (
 	pclog "github.com/pingcap/log"
 	"github.com/pingcap/tidb/br/pkg/storage"
 	"github.com/pingcap/tidb/br/pkg/summary"
-	"github.com/pingcap/tidb/br/pkg/version"
 	"github.com/pingcap/tidb/pkg/util"
 	"github.com/tadapin/pg-dumpling/cli"
 	tcontext "github.com/tadapin/pg-dumpling/context"
@@ -32,12 +30,6 @@ import (
 )
 
 var openDBFunc = openDB
-
-var errEmptyHandleVals = errors.New("empty handleVals for TiDB table")
-
-// After TiDB v6.2.0 we always enable tidb_enable_paging by default.
-// see https://docs.pingcap.com/zh/tidb/dev/system-variables#tidb_enable_paging-%E4%BB%8E-v540-%E7%89%88%E6%9C%AC%E5%BC%80%E5%A7%8B%E5%BC%95%E5%85%A5
-var enablePagingVersion = semver.New("6.2.0")
 
 // Dumper is the dump progress structure
 type Dumper struct {
@@ -337,33 +329,6 @@ func (d *Dumper) dumpDatabases(tctx *tcontext.Context, metaConn *BaseConn, taskC
 	conf := d.conf
 	allTables := conf.Tables
 
-	// policy should be created before database
-	// placement policy in other server type can be different, so we only handle the tidb server
-	if conf.ServerInfo.ServerType == version.ServerTypeTiDB {
-		policyNames, err := ListAllPlacementPolicyNames(tctx, metaConn)
-		if err != nil {
-			errCause := errors.Cause(err)
-			if mysqlErr, ok := errCause.(*mysql.MySQLError); ok && mysqlErr.Number == ErrNoSuchTable {
-				// some old tidb version and other server type doesn't support placement rules, we can skip it.
-				tctx.L().Debug("cannot dump placement policy, maybe the server doesn't support it", log.ShortError(err))
-			} else {
-				tctx.L().Warn("fail to dump placement policy: ", log.ShortError(err))
-			}
-		}
-		for _, policy := range policyNames {
-			createPolicySQL, err := ShowCreatePlacementPolicy(tctx, metaConn, policy)
-			if err != nil {
-				return errors.Trace(err)
-			}
-			wrappedCreatePolicySQL := fmt.Sprintf("/*T![placement] %s */", createPolicySQL)
-			task := NewTaskPolicyMeta(policy, wrappedCreatePolicySQL)
-			ctxDone := d.sendTaskToChan(tctx, task, taskChan)
-			if ctxDone {
-				return tctx.Err()
-			}
-		}
-	}
-
 	for dbName, tables := range allTables {
 		if !conf.NoSchemas {
 			createDatabaseSQL, err := ShowCreateDatabase(tctx, metaConn, dbName)
@@ -513,22 +478,6 @@ func (d *Dumper) dumpWholeTableDirectly(tctx *tcontext.Context, meta TableMeta, 
 
 func (d *Dumper) sequentialDumpTable(tctx *tcontext.Context, conn *BaseConn, meta TableMeta, taskChan chan<- Task) error {
 	conf := d.conf
-	if conf.ServerInfo.ServerType == version.ServerTypeTiDB {
-		task, err := d.buildConcatTask(tctx, conn, meta)
-		if err != nil {
-			return errors.Trace(err)
-		}
-		if task != nil {
-			ctxDone := d.sendTaskToChan(tctx, task, taskChan)
-			if ctxDone {
-				return tctx.Err()
-			}
-			return nil
-		}
-		tctx.L().Info("didn't build tidb concat sqls, will select all from table now",
-			zap.String("database", meta.DatabaseName()),
-			zap.String("table", meta.TableName()))
-	}
 	orderByClause, err := buildOrderByClause(tctx, conf, conn, meta.DatabaseName(), meta.TableName(), meta.HasImplicitRowID())
 	if err != nil {
 		return err
@@ -675,22 +624,7 @@ func prepareTableListToDump(tctx *tcontext.Context, conf *Config, db *sql.Conn) 
 		return nil
 	}
 
-	var listType listTableType
-
-	// TiDB has optimized the performance of reading INFORMATION_SCHEMA.TABLES
-	if conf.ServerInfo.ServerType == version.ServerTypeTiDB {
-		listType = listTableByInfoSchema
-	} else {
-		ifSeqExists, err := checkIfSeqExists(db)
-		if err != nil {
-			return err
-		}
-		if ifSeqExists {
-			listType = listTableByShowFullTables
-		} else {
-			listType = getListTableTypeByConf(conf)
-		}
-	}
+	listType := getListTableTypeByConf(conf)
 
 	if conf.SpecifiedTables {
 		return updateSpecifiedTablesMeta(tctx, db, conf.Tables, listType)
@@ -727,12 +661,6 @@ func dumpTableMeta(tctx *tcontext.Context, conf *Config, conn *BaseConn, db stri
 		colTypes         []*sql.ColumnType
 		hasImplicitRowID bool
 	)
-	if conf.ServerInfo.ServerType == version.ServerTypeTiDB {
-		hasImplicitRowID, err = SelectTiDBRowID(tctx, conn, db, tbl)
-		if err != nil {
-			tctx.L().Info("check implicit rowID failed", zap.String("database", db), zap.String("table", tbl), log.ShortError(err))
-		}
-	}
 
 	// If all columns are generated
 	if table.Type == TableTypeBase {
@@ -769,14 +697,6 @@ func dumpTableMeta(tctx *tcontext.Context, conf *Config, conn *BaseConn, db stri
 		}
 		meta.showCreateTable = createTableSQL
 		meta.showCreateView = createViewSQL
-		return meta, nil
-	case TableTypeSequence:
-		sequenceName := table.Name
-		createSequenceSQL, err2 := ShowCreateSequence(tctx, conn, db, sequenceName, conf)
-		if err2 != nil {
-			return meta, err2
-		}
-		meta.showCreateTable = createSequenceSQL
 		return meta, nil
 	}
 
@@ -922,43 +842,10 @@ func validateResolveAutoConsistency(d *Dumper) error {
 	return nil
 }
 
-// setDefaultSessionParams is a step to set default params for session params.
-func setDefaultSessionParams(si version.ServerInfo, sessionParams map[string]any) {
-	defaultSessionParams := map[string]any{}
-	if si.ServerType == version.ServerTypeTiDB && si.HasTiKV && si.ServerVersion.Compare(*enablePagingVersion) >= 0 {
-		defaultSessionParams["tidb_enable_paging"] = "ON"
-	}
-	for k, v := range defaultSessionParams {
-		if _, ok := sessionParams[k]; !ok {
-			sessionParams[k] = v
-		}
-	}
-}
-
 // setSessionParam is an initialization step of Dumper.
 func setSessionParam(d *Dumper) error {
 	conf, pool := d.conf, d.dbHandle
-	si := conf.ServerInfo
-	consistency, snapshot := conf.Consistency, conf.Snapshot
-	sessionParam := conf.SessionParams
-	if si.ServerType == version.ServerTypeTiDB && conf.TiDBMemQuotaQuery != UnspecifiedSize {
-		sessionParam[TiDBMemQuotaQueryName] = conf.TiDBMemQuotaQuery
-	}
 	var err error
-	if snapshot != "" {
-		if si.ServerType != version.ServerTypeTiDB {
-			return errors.New("snapshot consistency is not supported for this server")
-		}
-		if consistency == ConsistencyTypeSnapshot {
-			conf.ServerInfo.HasTiKV, err = CheckTiDBWithTiKV(pool)
-			if err != nil {
-				d.L().Info("cannot check whether TiDB has TiKV, will apply tidb_snapshot by default. This won't affect dump process", log.ShortError(err))
-			}
-			if conf.ServerInfo.HasTiKV {
-				sessionParam[snapshotVar] = snapshot
-			}
-		}
-	}
 	if d.dbHandle, err = resetDBWithSessionParams(d.tctx, pool, conf.GetDriverConfig(""), conf.SessionParams); err != nil {
 		return errors.Trace(err)
 	}

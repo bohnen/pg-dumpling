@@ -6,7 +6,6 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
-	"encoding/json"
 	"fmt"
 	"io"
 	"math"
@@ -16,14 +15,8 @@ import (
 	"github.com/go-sql-driver/mysql"
 	"github.com/pingcap/errors"
 	"github.com/pingcap/failpoint"
-	"github.com/pingcap/tidb/br/pkg/version"
 	tcontext "github.com/tadapin/pg-dumpling/context"
 	"github.com/tadapin/pg-dumpling/log"
-	dbconfig "github.com/pingcap/tidb/pkg/config"
-	"github.com/pingcap/tidb/pkg/errno"
-	"github.com/pingcap/tidb/pkg/meta/model"
-	pmodel "github.com/pingcap/tidb/pkg/parser/model"
-	pd "github.com/tikv/pd/client/http"
 	"go.uber.org/multierr"
 	"go.uber.org/zap"
 )
@@ -101,20 +94,6 @@ func ShowCreateTable(tctx *tcontext.Context, db *BaseConn, database, table strin
 	return oneRow[1], nil
 }
 
-// ShowCreatePlacementPolicy constructs the create policy SQL for a specified table
-// returns (createPolicySQL, error)
-func ShowCreatePlacementPolicy(tctx *tcontext.Context, db *BaseConn, policy string) (string, error) {
-	var oneRow [2]string
-	handleOneRow := func(rows *sql.Rows) error {
-		return rows.Scan(&oneRow[0], &oneRow[1])
-	}
-	query := fmt.Sprintf("SHOW CREATE PLACEMENT POLICY `%s`", escapeString(policy))
-	err := db.QuerySQL(tctx, handleOneRow, func() {
-		oneRow[0], oneRow[1] = "", ""
-	}, query)
-	return oneRow[1], err
-}
-
 // ShowCreateView constructs the create view SQL for a specified view
 // returns (createFakeTableSQL, createViewSQL, error)
 func ShowCreateView(tctx *tcontext.Context, db *BaseConn, database, view string) (createFakeTableSQL string, createRealViewSQL string, err error) {
@@ -173,60 +152,6 @@ func ShowCreateView(tctx *tcontext.Context, db *BaseConn, database, view string)
 	RestoreCharset(&createViewSQL)
 
 	return createTableSQL.String(), createViewSQL.String(), nil
-}
-
-// ShowCreateSequence constructs the create sequence SQL for a specified sequence
-// returns (createSequenceSQL, error)
-func ShowCreateSequence(tctx *tcontext.Context, db *BaseConn, database, sequence string, conf *Config) (string, error) {
-	var oneRow [2]string
-	handleOneRow := func(rows *sql.Rows) error {
-		return rows.Scan(&oneRow[0], &oneRow[1])
-	}
-	var (
-		createSequenceSQL  strings.Builder
-		nextNotCachedValue int64
-	)
-	query := fmt.Sprintf("SHOW CREATE SEQUENCE `%s`.`%s`", escapeString(database), escapeString(sequence))
-	err := db.QuerySQL(tctx, handleOneRow, func() {
-		oneRow[0], oneRow[1] = "", ""
-	}, query)
-	if err != nil {
-		return "", err
-	}
-	createSequenceSQL.WriteString(oneRow[1])
-	createSequenceSQL.WriteString(";\n")
-
-	switch conf.ServerInfo.ServerType {
-	case version.ServerTypeTiDB:
-		// Get next not allocated auto increment id of the whole cluster
-		query := fmt.Sprintf("SHOW TABLE `%s`.`%s` NEXT_ROW_ID", escapeString(database), escapeString(sequence))
-		results, err := db.QuerySQLWithColumns(tctx, []string{"NEXT_GLOBAL_ROW_ID", "ID_TYPE"}, query)
-		if err != nil {
-			return "", err
-		}
-		for _, oneRow := range results {
-			nextGlobalRowID, idType := oneRow[0], oneRow[1]
-			if idType == "SEQUENCE" {
-				nextNotCachedValue, _ = strconv.ParseInt(nextGlobalRowID, 10, 64)
-			}
-		}
-		fmt.Fprintf(&createSequenceSQL, "SELECT SETVAL(`%s`,%d);\n", escapeString(sequence), nextNotCachedValue)
-	case version.ServerTypeMariaDB:
-		var oneRow1 string
-		handleOneRow1 := func(rows *sql.Rows) error {
-			return rows.Scan(&oneRow1)
-		}
-		query := fmt.Sprintf("SELECT NEXT_NOT_CACHED_VALUE FROM `%s`.`%s`", escapeString(database), escapeString(sequence))
-		err := db.QuerySQL(tctx, handleOneRow1, func() {
-			oneRow1 = ""
-		}, query)
-		if err != nil {
-			return "", err
-		}
-		nextNotCachedValue, _ = strconv.ParseInt(oneRow1, 10, 64)
-		fmt.Fprintf(&createSequenceSQL, "SELECT SETVAL(`%s`,%d);\n", escapeString(sequence), nextNotCachedValue)
-	}
-	return createSequenceSQL.String(), nil
 }
 
 // SetCharset builds the set charset SQLs
@@ -472,24 +397,6 @@ func ListAllDatabasesTables(tctx *tcontext.Context, db *sql.Conn, databaseNames 
 	return dbTables, nil
 }
 
-// ListAllPlacementPolicyNames returns all placement policy names.
-func ListAllPlacementPolicyNames(tctx *tcontext.Context, db *BaseConn) ([]string, error) {
-	var policyList []string
-	var policy string
-	const query = "select distinct policy_name from information_schema.placement_policies where policy_name is not null;"
-	err := db.QuerySQL(tctx, func(rows *sql.Rows) error {
-		err := rows.Scan(&policy)
-		if err != nil {
-			return errors.Trace(err)
-		}
-		policyList = append(policyList, policy)
-		return nil
-	}, func() {
-		policyList = policyList[:0]
-	}, query)
-	return policyList, errors.Annotatef(err, "sql: %s", query)
-}
-
 // SelectVersion gets the version information from the database server
 func SelectVersion(db *sql.DB) (string, error) {
 	var versionInfo string
@@ -559,25 +466,6 @@ func buildOrderByClause(tctx *tcontext.Context, conf *Config, db *BaseConn, data
 		return "", errors.Trace(err)
 	}
 	return buildOrderByClauseString(cols), nil
-}
-
-// SelectTiDBRowID checks whether this table has _tidb_rowid column
-func SelectTiDBRowID(tctx *tcontext.Context, db *BaseConn, database, table string) (bool, error) {
-	tiDBRowIDQuery := fmt.Sprintf("SELECT _tidb_rowid from `%s`.`%s` LIMIT 1", escapeString(database), escapeString(table))
-	hasImplictRowID := false
-	err := db.ExecSQL(tctx, func(_ sql.Result, err error) error {
-		if err != nil {
-			hasImplictRowID = false
-			errMsg := strings.ToLower(err.Error())
-			if strings.Contains(errMsg, fmt.Sprintf("%d", errno.ErrBadField)) {
-				return nil
-			}
-			return errors.Annotatef(err, "sql: %s", tiDBRowIDQuery)
-		}
-		hasImplictRowID = true
-		return nil
-	}, tiDBRowIDQuery)
-	return hasImplictRowID, err
 }
 
 // GetSuitableRows gets suitable rows for each table
@@ -723,61 +611,6 @@ func getNumericIndex(tctx *tcontext.Context, db *BaseConn, meta TableMeta) (stri
 	return keyColumn, nil
 }
 
-// FlushTableWithReadLock flush tables with read lock
-func FlushTableWithReadLock(ctx context.Context, db *sql.Conn) error {
-	const ftwrlQuery = "FLUSH TABLES WITH READ LOCK"
-	_, err := db.ExecContext(ctx, ftwrlQuery)
-	return errors.Annotatef(err, "sql: %s", ftwrlQuery)
-}
-
-// LockTables locks table with read lock
-func LockTables(ctx context.Context, db *sql.Conn, database, table string) error {
-	lockTableQuery := fmt.Sprintf("LOCK TABLES `%s`.`%s` READ", escapeString(database), escapeString(table))
-	_, err := db.ExecContext(ctx, lockTableQuery)
-	return errors.Annotatef(err, "sql: %s", lockTableQuery)
-}
-
-// UnlockTables unlocks all tables' lock
-func UnlockTables(ctx context.Context, db *sql.Conn) error {
-	const unlockTableQuery = "UNLOCK TABLES"
-	_, err := db.ExecContext(ctx, unlockTableQuery)
-	return errors.Annotatef(err, "sql: %s", unlockTableQuery)
-}
-
-// ShowMasterStatus get SHOW MASTER STATUS result from database
-func ShowMasterStatus(db *sql.Conn, serverInfo version.ServerInfo) ([]string, error) {
-	var oneRow []string
-	handleOneRow := func(rows *sql.Rows) error {
-		cols, err := rows.Columns()
-		if err != nil {
-			return errors.Trace(err)
-		}
-		fieldNum := len(cols)
-		oneRow = make([]string, fieldNum)
-		addr := make([]any, fieldNum)
-		for i := range oneRow {
-			addr[i] = &oneRow[i]
-		}
-		return rows.Scan(addr...)
-	}
-
-	// MySQL 8.4.0 and newer: SHOW BINARY LOG STATUS
-	// TiDB, MariaDB, Old MySQL: SHOW MASTER STATUS
-	showMasterStatusQuery := "SHOW MASTER STATUS"
-	if serverInfo.ServerVersion != nil {
-		if serverInfo.ServerType == version.ServerTypeMySQL &&
-			!serverInfo.ServerVersion.LessThan(*minNewTerminologyMySQL) {
-			showMasterStatusQuery = "SHOW BINARY LOG STATUS"
-		}
-	}
-
-	err := simpleQuery(db, showMasterStatusQuery, handleOneRow)
-	if err != nil {
-		return nil, errors.Annotatef(err, "sql: %s", showMasterStatusQuery)
-	}
-	return oneRow, nil
-}
-
 // GetSpecifiedColumnValueAndClose get columns' values whose name is equal to columnName and close the given rows
 func GetSpecifiedColumnValueAndClose(rows *sql.Rows, columnName string) ([]string, error) {
 	if rows == nil {
@@ -855,111 +688,10 @@ func GetSpecifiedColumnValuesAndClose(rows *sql.Rows, columnName ...string) ([][
 	return strs, errors.Trace(rows.Err())
 }
 
-// GetPdAddrs gets PD address from TiDB
-func GetPdAddrs(tctx *tcontext.Context, db *sql.DB) ([]string, error) {
-	const query = "SELECT * FROM information_schema.cluster_info where type = 'pd';"
-	rows, err := db.QueryContext(tctx, query)
-	if err != nil {
-		return []string{}, errors.Annotatef(err, "sql: %s", query)
-	}
-	pdAddrs, err := GetSpecifiedColumnValueAndClose(rows, "STATUS_ADDRESS")
-	return pdAddrs, errors.Annotatef(err, "sql: %s", query)
-}
-
-// GetTiDBDDLIDs gets DDL IDs from TiDB
-func GetTiDBDDLIDs(tctx *tcontext.Context, db *sql.DB) ([]string, error) {
-	const query = "SELECT * FROM information_schema.tidb_servers_info;"
-	rows, err := db.QueryContext(tctx, query)
-	if err != nil {
-		return []string{}, errors.Annotatef(err, "sql: %s", query)
-	}
-	ddlIDs, err := GetSpecifiedColumnValueAndClose(rows, "DDL_ID")
-	return ddlIDs, errors.Annotatef(err, "sql: %s", query)
-}
-
-// getTiDBConfig gets tidb config from TiDB server
-// @@tidb_config details doc https://docs.pingcap.com/tidb/stable/system-variables#tidb_config
-// this variable exists at least from v2.0.0, so this works in most existing tidb instances
-func getTiDBConfig(db *sql.Conn) (dbconfig.Config, error) {
-	const query = "SELECT @@tidb_config;"
-	var (
-		tidbConfig      dbconfig.Config
-		tidbConfigBytes []byte
-	)
-	row := db.QueryRowContext(context.Background(), query)
-	err := row.Scan(&tidbConfigBytes)
-	if err != nil {
-		return tidbConfig, errors.Annotatef(err, "sql: %s", query)
-	}
-	err = json.Unmarshal(tidbConfigBytes, &tidbConfig)
-	return tidbConfig, errors.Annotatef(err, "sql: %s", query)
-}
-
-// CheckTiDBWithTiKV use sql to check whether current TiDB has TiKV
-func CheckTiDBWithTiKV(db *sql.DB) (bool, error) {
-	conn, err := db.Conn(context.Background())
-	if err == nil {
-		defer func() {
-			_ = conn.Close()
-		}()
-		tidbConfig, err := getTiDBConfig(conn)
-		if err == nil {
-			return tidbConfig.Store == "tikv", nil
-		}
-	}
-	var count int
-	const query = "SELECT COUNT(1) as c FROM MYSQL.TiDB WHERE VARIABLE_NAME='tikv_gc_safe_point'"
-	row := db.QueryRow(query)
-	err = row.Scan(&count)
-	if err != nil {
-		// still return true here. Because sometimes users may not have privileges for MySQL.TiDB database
-		// In most production cases TiDB has TiKV
-		return true, errors.Annotatef(err, "sql: %s", query)
-	}
-	return count > 0, nil
-}
-
-// checkIfSeqExists use sql to check whether sequence exists
-func checkIfSeqExists(db *sql.Conn) (bool, error) {
-	var count int
-	const query = "SELECT COUNT(1) as c FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE='SEQUENCE'"
-	row := db.QueryRowContext(context.Background(), query)
-	err := row.Scan(&count)
-	if err != nil {
-		return false, errors.Annotatef(err, "sql: %s", query)
-	}
-
-	return count > 0, nil
-}
-
-// CheckTiDBEnableTableLock use sql variable to check whether current TiDB has TiKV
-func CheckTiDBEnableTableLock(db *sql.Conn) (bool, error) {
-	tidbConfig, err := getTiDBConfig(db)
-	if err != nil {
-		return false, err
-	}
-	return tidbConfig.EnableTableLock, nil
-}
-
 // snapshotFieldIndex is the column index of the snapshot field in
 // "SHOW MASTER STATUS" / "SHOW BINARY LOG STATUS" output. Retained as a local
 // constant after the consistency rewrite removed it from consistency.go.
 const snapshotFieldIndex = 1
-
-func getSnapshot(db *sql.Conn) (string, error) {
-	serverInfo := version.ServerInfo{
-		ServerType: version.ServerTypeTiDB,
-	}
-	str, err := ShowMasterStatus(db, serverInfo)
-	if err != nil {
-		return "", err
-	}
-	return str[snapshotFieldIndex], nil
-}
-
-func isUnknownSystemVariableErr(err error) bool {
-	return strings.Contains(err.Error(), "Unknown system variable")
-}
 
 // resetDBWithSessionParams will return a new sql.DB as a replacement for input `db` with new session parameters.
 // If returned error is nil, the input `db` will be closed.
@@ -981,9 +713,7 @@ func resetDBWithSessionParams(tctx *tcontext.Context, db *sql.DB, cfg *mysql.Con
 		s := fmt.Sprintf("SET SESSION %s = ?", k)
 		_, err := db.ExecContext(tctx, s, pv)
 		if err != nil {
-			if k == snapshotVar {
-				err = errors.Annotate(err, "fail to set snapshot for tidb, please set --consistency=none/--consistency=lock or fix snapshot problem")
-			} else if isUnknownSystemVariableErr(err) {
+			if strings.Contains(err.Error(), "Unknown system variable") {
 				tctx.L().Info("session variable is not supported by db", zap.String("variable", k), zap.Reflect("value", v))
 				continue
 			}
@@ -1222,35 +952,6 @@ func buildOrderByClauseString(handleColNames []string) string {
 	return fmt.Sprintf("ORDER BY %s", strings.Join(quotaCols, separator))
 }
 
-func buildLockTablesSQL(allTables DatabaseTables, blockList map[string]map[string]any) string {
-	// ,``.`` READ has 11 bytes, "LOCK TABLE" has 10 bytes
-	estimatedCap := len(allTables)*11 + 10
-	s := bytes.NewBuffer(make([]byte, 0, estimatedCap))
-	n := false
-	for dbName, tables := range allTables {
-		escapedDBName := escapeString(dbName)
-		for _, table := range tables {
-			// Lock views will lock related tables. However, we won't dump data only the create sql of view, so we needn't lock view here.
-			// Besides, mydumper also only lock base table here. https://github.com/maxbube/mydumper/blob/1fabdf87e3007e5934227b504ad673ba3697946c/mydumper.c#L1568
-			if table.Type != TableTypeBase {
-				continue
-			}
-			if blockTable, ok := blockList[dbName]; ok {
-				if _, ok := blockTable[table.Name]; ok {
-					continue
-				}
-			}
-			if !n {
-				fmt.Fprintf(s, "LOCK TABLES `%s`.`%s` READ", escapedDBName, escapeString(table.Name))
-				n = true
-			} else {
-				fmt.Fprintf(s, ",`%s`.`%s` READ", escapedDBName, escapeString(table.Name))
-			}
-		}
-	}
-	return s.String()
-}
-
 type oneStrColumnTable struct {
 	data []string
 }
@@ -1396,24 +1097,6 @@ func detectEstimateRows(tctx *tcontext.Context, db *BaseConn, query string, fiel
 	return uint64(estRows)
 }
 
-func parseSnapshotToTSO(pool *sql.DB, snapshot string) (uint64, error) {
-	snapshotTS, err := strconv.ParseUint(snapshot, 10, 64)
-	if err == nil {
-		return snapshotTS, nil
-	}
-	var tso sql.NullInt64
-	query := "SELECT unix_timestamp(?)"
-	row := pool.QueryRow(query, snapshot)
-	err = row.Scan(&tso)
-	if err != nil {
-		return 0, errors.Annotatef(err, "sql: %s", strings.ReplaceAll(query, "?", fmt.Sprintf(`"%s"`, snapshot)))
-	}
-	if !tso.Valid {
-		return 0, errors.Errorf("snapshot %s format not supported. please use tso or '2006-01-02 15:04:05' format time", snapshot)
-	}
-	return (uint64(tso.Int64) << 18) * 1000, nil
-}
-
 func buildWhereCondition(conf *Config, where string) string {
 	var query strings.Builder
 	separator := "WHERE"
@@ -1462,198 +1145,3 @@ func GetPartitionNames(tctx *tcontext.Context, db *BaseConn, schema, table strin
 	return
 }
 
-// GetPartitionTableIDs get partition tableIDs through histograms.
-// SHOW STATS_HISTOGRAMS  has db_name,table_name,partition_name but doesn't have partition id
-// mysql.stats_histograms has partition_id but doesn't have db_name,table_name,partition_name
-// So we combine the results from these two sqls to get partition ids for each table
-// If UPDATE_TIME,DISTINCT_COUNT are equal, we assume these two records can represent one line.
-// If histograms are not accurate or (UPDATE_TIME,DISTINCT_COUNT) has duplicate data, it's still fine.
-// Because the possibility is low and the effect is that we will select more than one regions in one time,
-// this will not affect the correctness of the dumping data and will not affect the memory usage much.
-// This method is tricky, but no better way is found.
-// Because TiDB v3.0.0's information_schema.partition table doesn't have partition name or partition id info
-// return (dbName -> tbName -> partitionName -> partitionID, error)
-func GetPartitionTableIDs(db *sql.Conn, tables map[string]map[string]struct{}) (map[string]map[string]map[string]int64, error) {
-	const (
-		showStatsHistogramsSQL   = "SHOW STATS_HISTOGRAMS"
-		selectStatsHistogramsSQL = "SELECT TABLE_ID,FROM_UNIXTIME(VERSION DIV 262144 DIV 1000,'%Y-%m-%d %H:%i:%s') AS UPDATE_TIME,DISTINCT_COUNT FROM mysql.stats_histograms"
-	)
-	partitionIDs := make(map[string]map[string]map[string]int64, len(tables))
-	rows, err := db.QueryContext(context.Background(), showStatsHistogramsSQL)
-	if err != nil {
-		return nil, errors.Annotatef(err, "sql: %s", showStatsHistogramsSQL)
-	}
-	results, err := GetSpecifiedColumnValuesAndClose(rows, "DB_NAME", "TABLE_NAME", "PARTITION_NAME", "UPDATE_TIME", "DISTINCT_COUNT")
-	if err != nil {
-		return nil, errors.Annotatef(err, "sql: %s", showStatsHistogramsSQL)
-	}
-	type partitionInfo struct {
-		dbName, tbName, partitionName string
-	}
-	saveMap := make(map[string]map[string]partitionInfo)
-	for _, oneRow := range results {
-		dbName, tbName, partitionName, updateTime, distinctCount := oneRow[0], oneRow[1], oneRow[2], oneRow[3], oneRow[4]
-		if len(partitionName) == 0 {
-			continue
-		}
-		if tbm, ok := tables[dbName]; ok {
-			if _, ok = tbm[tbName]; ok {
-				if _, ok = saveMap[updateTime]; !ok {
-					saveMap[updateTime] = make(map[string]partitionInfo)
-				}
-				saveMap[updateTime][distinctCount] = partitionInfo{
-					dbName:        dbName,
-					tbName:        tbName,
-					partitionName: partitionName,
-				}
-			}
-		}
-	}
-	if len(saveMap) == 0 {
-		return map[string]map[string]map[string]int64{}, nil
-	}
-	err = simpleQuery(db, selectStatsHistogramsSQL, func(rows *sql.Rows) error {
-		var (
-			tableID                   int64
-			updateTime, distinctCount string
-		)
-		err2 := rows.Scan(&tableID, &updateTime, &distinctCount)
-		if err2 != nil {
-			return errors.Trace(err2)
-		}
-		if mpt, ok := saveMap[updateTime]; ok {
-			if partition, ok := mpt[distinctCount]; ok {
-				dbName, tbName, partitionName := partition.dbName, partition.tbName, partition.partitionName
-				if _, ok := partitionIDs[dbName]; !ok {
-					partitionIDs[dbName] = make(map[string]map[string]int64)
-				}
-				if _, ok := partitionIDs[dbName][tbName]; !ok {
-					partitionIDs[dbName][tbName] = make(map[string]int64)
-				}
-				partitionIDs[dbName][tbName][partitionName] = tableID
-			}
-		}
-		return nil
-	})
-	return partitionIDs, err
-}
-
-// GetDBInfo get model.DBInfos from database sql interface.
-// We need table_id to check whether a region belongs to this table
-func GetDBInfo(db *sql.Conn, tables map[string]map[string]struct{}) ([]*model.DBInfo, error) {
-	const tableIDSQL = "SELECT TABLE_SCHEMA,TABLE_NAME,TIDB_TABLE_ID FROM INFORMATION_SCHEMA.TABLES ORDER BY TABLE_SCHEMA"
-
-	schemas := make([]*model.DBInfo, 0, len(tables))
-	var (
-		tableSchema, tableName string
-		tidbTableID            int64
-	)
-	partitionIDs, err := GetPartitionTableIDs(db, tables)
-	if err != nil {
-		return nil, err
-	}
-	err = simpleQuery(db, tableIDSQL, func(rows *sql.Rows) error {
-		err2 := rows.Scan(&tableSchema, &tableName, &tidbTableID)
-		if err2 != nil {
-			return errors.Trace(err2)
-		}
-		if tbm, ok := tables[tableSchema]; !ok {
-			return nil
-		} else if _, ok = tbm[tableName]; !ok {
-			return nil
-		}
-		last := len(schemas) - 1
-		if last < 0 || schemas[last].Name.O != tableSchema {
-			dbInfo := &model.DBInfo{Name: pmodel.CIStr{O: tableSchema}}
-			dbInfo.Deprecated.Tables = make([]*model.TableInfo, 0, len(tables[tableSchema]))
-			schemas = append(schemas, dbInfo)
-			last++
-		}
-		var partition *model.PartitionInfo
-		if tbm, ok := partitionIDs[tableSchema]; ok {
-			if ptm, ok := tbm[tableName]; ok {
-				partition = &model.PartitionInfo{Definitions: make([]model.PartitionDefinition, 0, len(ptm))}
-				for partitionName, partitionID := range ptm {
-					partition.Definitions = append(partition.Definitions, model.PartitionDefinition{
-						ID:   partitionID,
-						Name: pmodel.CIStr{O: partitionName},
-					})
-				}
-			}
-		}
-		schemas[last].Deprecated.Tables = append(schemas[last].Deprecated.Tables, &model.TableInfo{
-			ID:        tidbTableID,
-			Name:      pmodel.CIStr{O: tableName},
-			Partition: partition,
-		})
-		return nil
-	})
-	return schemas, err
-}
-
-// GetRegionInfos get region info including regionID, start key, end key from database sql interface.
-// start key, end key includes information to help split table
-func GetRegionInfos(db *sql.Conn) (*pd.RegionsInfo, error) {
-	const tableRegionSQL = "SELECT REGION_ID,START_KEY,END_KEY FROM INFORMATION_SCHEMA.TIKV_REGION_STATUS ORDER BY START_KEY;"
-	var (
-		regionID         int64
-		startKey, endKey string
-	)
-	regionsInfo := &pd.RegionsInfo{Regions: make([]pd.RegionInfo, 0)}
-	err := simpleQuery(db, tableRegionSQL, func(rows *sql.Rows) error {
-		err := rows.Scan(&regionID, &startKey, &endKey)
-		if err != nil {
-			return errors.Trace(err)
-		}
-		regionsInfo.Regions = append(regionsInfo.Regions, pd.RegionInfo{
-			ID:       regionID,
-			StartKey: startKey,
-			EndKey:   endKey,
-		})
-		return nil
-	})
-	return regionsInfo, err
-}
-
-// GetCharsetAndDefaultCollation gets charset and default collation map.
-func GetCharsetAndDefaultCollation(ctx context.Context, db *sql.Conn) (map[string]string, error) {
-	charsetAndDefaultCollation := make(map[string]string)
-	query := "SHOW CHARACTER SET"
-
-	// Show an example.
-	/*
-		mysql> SHOW CHARACTER SET;
-		+----------+---------------------------------+---------------------+--------+
-		| Charset  | Description                     | Default collation   | Maxlen |
-		+----------+---------------------------------+---------------------+--------+
-		| armscii8 | ARMSCII-8 Armenian              | armscii8_general_ci |      1 |
-		| ascii    | US ASCII                        | ascii_general_ci    |      1 |
-		| big5     | Big5 Traditional Chinese        | big5_chinese_ci     |      2 |
-		| binary   | Binary pseudo charset           | binary              |      1 |
-		| cp1250   | Windows Central European        | cp1250_general_ci   |      1 |
-		| cp1251   | Windows Cyrillic                | cp1251_general_ci   |      1 |
-		+----------+---------------------------------+---------------------+--------+
-	*/
-
-	rows, err := db.QueryContext(ctx, query)
-	if err != nil {
-		return nil, errors.Annotatef(err, "sql: %s", query)
-	}
-
-	defer rows.Close()
-	for rows.Next() {
-		var charset, description, collation string
-		var maxlen int
-		if scanErr := rows.Scan(&charset, &description, &collation, &maxlen); scanErr != nil {
-			return nil, errors.Annotatef(err, "sql: %s", query)
-		}
-		charsetAndDefaultCollation[strings.ToLower(charset)] = collation
-	}
-	if err = rows.Close(); err != nil {
-		return nil, errors.Annotatef(err, "sql: %s", query)
-	}
-	if err = rows.Err(); err != nil {
-		return nil, errors.Annotatef(err, "sql: %s", query)
-	}
-	return charsetAndDefaultCollation, err
-}
