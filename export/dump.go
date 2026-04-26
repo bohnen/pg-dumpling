@@ -639,7 +639,7 @@ func prepareTableListToDump(tctx *tcontext.Context, conf *Config, db *sql.Conn) 
 
 func dumpTableMeta(tctx *tcontext.Context, conf *Config, conn *BaseConn, db string, table *TableInfo) (TableMeta, error) {
 	tbl := table.Name
-	selectField, selectLen, err := buildSelectField(tctx, conn, db, tbl, conf.CompleteInsert)
+	selectField, selectLen, err := buildSelectField(tctx, conn, db, tbl, conf.CompleteInsert, conf.FileType == "csv")
 	if err != nil {
 		return nil, err
 	}

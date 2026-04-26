@@ -587,31 +587,104 @@ func createConnWithConsistency(ctx context.Context, db *sql.DB, repeatableRead b
 // adopt with SET TRANSACTION SNAPSHOT.
 func SetPgSnapshotToken(token string) { pgSnapshotToken = token }
 
+// pgMigrationCast wraps a column reference in a server-side cast that produces
+// a MySQL/TiDB-friendly text representation, based on the column's PostgreSQL
+// type. The wrapped expression is aliased back to the original column name so
+// downstream rows.Columns() / writer code keeps working.
+//
+// dataType is the value of information_schema.columns.data_type; udtName is
+// the udt_name and disambiguates data_type='USER-DEFINED' (enum, pgvector,
+// hstore, ranges).
+//
+// For types that don't need rewriting (integer, numeric, text, varchar, ...)
+// the bare quoted reference is returned unchanged.
+func pgMigrationCast(colName, dataType, udtName string) string {
+	q := pgQuoteIdent(colName)
+	alias := " AS " + q
+	switch dataType {
+	case "timestamp with time zone":
+		return "to_char(" + q + " AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS.US')" + alias
+	case "timestamp without time zone":
+		return "to_char(" + q + ", 'YYYY-MM-DD HH24:MI:SS.US')" + alias
+	case "date":
+		return "to_char(" + q + ", 'YYYY-MM-DD')" + alias
+	case "time without time zone":
+		// PG has no to_char(time, text); cast to text. The textual form
+		// is HH24:MI:SS[.fractional] with 0-6 fractional digits — MySQL
+		// TIME(6) accepts that range.
+		return "(" + q + ")::text" + alias
+	case "time with time zone":
+		// "timetz AT TIME ZONE 'UTC'" returns timetz (per PG docs), so we
+		// have to explicitly cast away the TZ with ::time before stringifying.
+		return "((" + q + " AT TIME ZONE 'UTC')::time)::text" + alias
+	case "interval":
+		return "EXTRACT(EPOCH FROM " + q + ")::numeric" + alias
+	case "boolean":
+		return "(" + q + ")::int" + alias
+	case "bytea":
+		return "encode(" + q + ", 'hex')" + alias
+	case "uuid", "json", "jsonb", "inet", "cidr", "macaddr", "macaddr8",
+		"xml", "money":
+		return "(" + q + ")::text" + alias
+	case "ARRAY":
+		return "to_jsonb(" + q + ")::text" + alias
+	case "tsvector", "tsquery":
+		return "(" + q + ")::text" + alias
+	case "USER-DEFINED":
+		switch udtName {
+		case "int4range", "int8range", "numrange", "tsrange", "tstzrange",
+			"daterange", "int4multirange", "int8multirange", "nummultirange",
+			"tsmultirange", "tstzmultirange", "datemultirange":
+			return "to_jsonb(" + q + ")::text" + alias
+		}
+		// Enums, pgvector (`vector`), hstore, custom domains: stringify.
+		// pgvector's text form '[1,2,3]' is directly compatible with TiDB
+		// VECTOR.
+		return "(" + q + ")::text" + alias
+	}
+	return q
+}
+
 // buildSelectField returns the selecting fields' string (comma-joined) and
 // the number of writable columns. Reads from information_schema.columns and
 // drops STORED/ALWAYS GENERATED columns from the projection so the dumped
 // INSERT statements remain valid on reload.
-func buildSelectField(tctx *tcontext.Context, db *BaseConn, dbName, tableName string, completeInsert bool) (string, int, error) {
+//
+// When migrationCasts is true (CSV mode for PG → MySQL/TiDB migration) each
+// non-trivial column is wrapped via pgMigrationCast so the values arrive at
+// the writer in a form MySQL/TiDB can ingest. In SQL mode the cast is skipped
+// to keep PG → PG round-trip lossless.
+func buildSelectField(tctx *tcontext.Context, db *BaseConn, dbName, tableName string, completeInsert, migrationCasts bool) (string, int, error) {
 	const q = `
-SELECT column_name, is_generated
+SELECT column_name, is_generated, data_type, udt_name
 FROM information_schema.columns
 WHERE table_schema = $1 AND table_name = $2
 ORDER BY ordinal_position`
-	results, err := db.QuerySQLWithColumns(tctx, []string{"column_name", "is_generated"}, q, dbName, tableName)
+	results, err := db.QuerySQLWithColumns(tctx,
+		[]string{"column_name", "is_generated", "data_type", "udt_name"},
+		q, dbName, tableName)
 	if err != nil {
 		return "", 0, err
 	}
 	availableFields := make([]string, 0, len(results))
 	hasGenerateColumn := false
 	for _, oneRow := range results {
-		fieldName, isGen := oneRow[0], oneRow[1]
+		fieldName, isGen, dataType, udtName := oneRow[0], oneRow[1], oneRow[2], oneRow[3]
 		if isGen == "ALWAYS" {
 			hasGenerateColumn = true
 			continue
 		}
-		availableFields = append(availableFields, pgQuoteIdent(fieldName))
+		var expr string
+		if migrationCasts {
+			expr = pgMigrationCast(fieldName, dataType, udtName)
+		} else {
+			expr = pgQuoteIdent(fieldName)
+		}
+		availableFields = append(availableFields, expr)
 	}
-	if completeInsert || hasGenerateColumn {
+	// Migration casts rename column expressions, so we have to spell them
+	// out in the SELECT (no '*' shortcut).
+	if completeInsert || hasGenerateColumn || migrationCasts {
 		return strings.Join(availableFields, ","), len(availableFields), nil
 	}
 	return "*", len(availableFields), nil
