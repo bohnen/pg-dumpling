@@ -5,7 +5,6 @@ package export
 import (
 	"math"
 
-	"github.com/pingcap/tidb/pkg/util/promutil"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 	"go.uber.org/atomic"
@@ -26,9 +25,9 @@ type metrics struct {
 	progressReady   atomic.Bool
 }
 
-func newMetrics(f promutil.Factory, constLabels prometheus.Labels) *metrics {
+func newMetrics(constLabels prometheus.Labels) *metrics {
 	m := metrics{}
-	m.finishedSizeGauge = f.NewGaugeVec(
+	m.finishedSizeGauge = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Namespace:   "dumpling",
 			Subsystem:   "dump",
@@ -36,7 +35,7 @@ func newMetrics(f promutil.Factory, constLabels prometheus.Labels) *metrics {
 			Help:        "counter for dumpling finished file size",
 			ConstLabels: constLabels,
 		}, []string{})
-	m.estimateTotalRowsCounter = f.NewCounterVec(
+	m.estimateTotalRowsCounter = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace:   "dumpling",
 			Subsystem:   "dump",
@@ -44,7 +43,7 @@ func newMetrics(f promutil.Factory, constLabels prometheus.Labels) *metrics {
 			Help:        "estimate total rows for dumpling tables",
 			ConstLabels: constLabels,
 		}, []string{})
-	m.finishedRowsGauge = f.NewGaugeVec(
+	m.finishedRowsGauge = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Namespace:   "dumpling",
 			Subsystem:   "dump",
@@ -52,7 +51,7 @@ func newMetrics(f promutil.Factory, constLabels prometheus.Labels) *metrics {
 			Help:        "counter for dumpling finished rows",
 			ConstLabels: constLabels,
 		}, []string{})
-	m.finishedTablesCounter = f.NewCounterVec(
+	m.finishedTablesCounter = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace:   "dumpling",
 			Subsystem:   "dump",
@@ -60,7 +59,7 @@ func newMetrics(f promutil.Factory, constLabels prometheus.Labels) *metrics {
 			Help:        "counter for dumpling finished tables",
 			ConstLabels: constLabels,
 		}, []string{})
-	m.writeTimeHistogram = f.NewHistogramVec(
+	m.writeTimeHistogram = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Namespace:   "dumpling",
 			Subsystem:   "write",
@@ -69,7 +68,7 @@ func newMetrics(f promutil.Factory, constLabels prometheus.Labels) *metrics {
 			Buckets:     prometheus.ExponentialBuckets(0.00005, 2, 20),
 			ConstLabels: constLabels,
 		}, []string{})
-	m.receiveWriteChunkTimeHistogram = f.NewHistogramVec(
+	m.receiveWriteChunkTimeHistogram = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Namespace:   "dumpling",
 			Subsystem:   "write",
@@ -78,7 +77,7 @@ func newMetrics(f promutil.Factory, constLabels prometheus.Labels) *metrics {
 			Buckets:     prometheus.ExponentialBuckets(0.00005, 2, 20),
 			ConstLabels: constLabels,
 		}, []string{})
-	m.errorCount = f.NewCounterVec(
+	m.errorCount = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace:   "dumpling",
 			Subsystem:   "dump",
@@ -86,7 +85,7 @@ func newMetrics(f promutil.Factory, constLabels prometheus.Labels) *metrics {
 			Help:        "Total error count during dumping progress",
 			ConstLabels: constLabels,
 		}, []string{})
-	m.taskChannelCapacity = f.NewGaugeVec(
+	m.taskChannelCapacity = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Namespace:   "dumpling",
 			Subsystem:   "dump",
@@ -97,7 +96,17 @@ func newMetrics(f promutil.Factory, constLabels prometheus.Labels) *metrics {
 	return &m
 }
 
-func (m *metrics) registerTo(registry promutil.Registry) {
+// metricRegistry is the minimal interface we need from a Prometheus registry —
+// satisfied by *prometheus.Registry and prometheus.Registerer.
+type metricRegistry interface {
+	MustRegister(...prometheus.Collector)
+	Unregister(prometheus.Collector) bool
+}
+
+func (m *metrics) registerTo(registry metricRegistry) {
+	if registry == nil {
+		return
+	}
 	registry.MustRegister(m.finishedSizeGauge)
 	registry.MustRegister(m.finishedRowsGauge)
 	registry.MustRegister(m.estimateTotalRowsCounter)
@@ -108,7 +117,10 @@ func (m *metrics) registerTo(registry promutil.Registry) {
 	registry.MustRegister(m.taskChannelCapacity)
 }
 
-func (m *metrics) unregisterFrom(registry promutil.Registry) {
+func (m *metrics) unregisterFrom(registry metricRegistry) {
+	if registry == nil {
+		return
+	}
 	registry.Unregister(m.finishedSizeGauge)
 	registry.Unregister(m.finishedRowsGauge)
 	registry.Unregister(m.estimateTotalRowsCounter)

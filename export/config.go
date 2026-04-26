@@ -5,22 +5,20 @@ package export
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"net"
+	"os"
 	"slices"
 	"strconv"
 	"strings"
 	"text/template"
 	"time"
 
-	"github.com/coreos/go-semver/semver"
 	"github.com/docker/go-units"
 	"github.com/pingcap/errors"
 	"github.com/pingcap/tidb/br/pkg/storage"
-	"github.com/pingcap/tidb/br/pkg/version"
-	"github.com/pingcap/tidb/pkg/util"
-	"github.com/pingcap/tidb/pkg/util/promutil"
 	filter "github.com/pingcap/tidb/pkg/util/table-filter"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/spf13/pflag"
@@ -163,7 +161,6 @@ type Config struct {
 	TableFilter        filter.Filter `json:"-"`
 	Where              string
 	FileType           string
-	ServerInfo         version.ServerInfo
 	Logger             *zap.Logger        `json:"-"`
 	OutputFileTemplate *template.Template `json:"-"`
 	Rows               uint64
@@ -175,16 +172,9 @@ type Config struct {
 	CsvOutputDialect   CSVDialect
 
 	Labels        prometheus.Labels       `json:"-"`
-	PromFactory   promutil.Factory        `json:"-"`
-	PromRegistry  promutil.Registry       `json:"-"`
+	PromRegistry  prometheus.Registerer   `json:"-"`
 	ExtStorage    storage.ExternalStorage `json:"-"`
 	MinTLSVersion uint16                  `json:"-"`
-}
-
-// ServerInfoUnknown is the unknown database type to dumpling
-var ServerInfoUnknown = version.ServerInfo{
-	ServerType:    version.ServerTypeUnknown,
-	ServerVersion: nil,
 }
 
 // DefaultConfig returns the default export Config for dumpling
@@ -202,7 +192,6 @@ func DefaultConfig() *Config {
 		FileSize:                 UnspecifiedSize,
 		StatementSize:            DefaultStatementSize,
 		OutputDirPath:            ".",
-		ServerInfo:               ServerInfoUnknown,
 		SortByPk:                 true,
 		Tables:                   nil,
 		Snapshot:                 "",
@@ -228,8 +217,7 @@ func DefaultConfig() *Config {
 		PosAfterConnect:          false,
 		CsvOutputDialect:         CSVDialectDefault,
 		SpecifiedTables:          false,
-		PromFactory:              promutil.NewDefaultFactory(),
-		PromRegistry:             promutil.NewDefaultRegistry(),
+		PromRegistry:             prometheus.NewRegistry(),
 		TransactionalConsistency: true,
 	}
 }
@@ -737,17 +725,68 @@ func adjustConfig(conf *Config, fns ...func(*Config) error) error {
 }
 
 func buildTLSConfig(conf *Config) error {
-	tlsConfig, err := util.NewTLSConfig(
-		util.WithCAPath(conf.Security.CAPath),
-		util.WithCertAndKeyPath(conf.Security.CertPath, conf.Security.KeyPath),
-		util.WithCAContent(conf.Security.SSLCABytes),
-		util.WithCertAndKeyContent(conf.Security.SSLCertBytes, conf.Security.SSLKeyBytes),
-		util.WithMinTLSVersion(conf.MinTLSVersion),
-	)
-	if err != nil {
-		return errors.Trace(err)
+	hasMaterial := conf.Security.CAPath != "" || conf.Security.CertPath != "" ||
+		conf.Security.KeyPath != "" || len(conf.Security.SSLCABytes) > 0 ||
+		len(conf.Security.SSLCertBytes) > 0 || len(conf.Security.SSLKeyBytes) > 0
+	if !hasMaterial && conf.MinTLSVersion == 0 {
+		conf.Security.TLS = nil
+		return nil
 	}
-	conf.Security.TLS = tlsConfig
+
+	minVer := conf.MinTLSVersion
+	if minVer == 0 {
+		minVer = tls.VersionTLS12
+	}
+	tlsCfg := &tls.Config{MinVersion: minVer} // #nosec G402
+
+	// CA certificates
+	if len(conf.Security.SSLCABytes) > 0 || conf.Security.CAPath != "" {
+		pool := x509.NewCertPool()
+		caBytes := conf.Security.SSLCABytes
+		if len(caBytes) == 0 {
+			b, err := os.ReadFile(conf.Security.CAPath)
+			if err != nil {
+				return errors.Annotatef(err, "read CA file %q", conf.Security.CAPath)
+			}
+			caBytes = b
+		}
+		if !pool.AppendCertsFromPEM(caBytes) {
+			return errors.Errorf("failed to append CA certificates from %q", conf.Security.CAPath)
+		}
+		tlsCfg.RootCAs = pool
+	}
+
+	// Client certificate / key pair
+	hasCert := len(conf.Security.SSLCertBytes) > 0 || conf.Security.CertPath != ""
+	hasKey := len(conf.Security.SSLKeyBytes) > 0 || conf.Security.KeyPath != ""
+	if hasCert != hasKey {
+		return errors.New("--cert and --key must be specified together")
+	}
+	if hasCert {
+		certBytes := conf.Security.SSLCertBytes
+		if len(certBytes) == 0 {
+			b, err := os.ReadFile(conf.Security.CertPath)
+			if err != nil {
+				return errors.Annotatef(err, "read cert file %q", conf.Security.CertPath)
+			}
+			certBytes = b
+		}
+		keyBytes := conf.Security.SSLKeyBytes
+		if len(keyBytes) == 0 {
+			b, err := os.ReadFile(conf.Security.KeyPath)
+			if err != nil {
+				return errors.Annotatef(err, "read key file %q", conf.Security.KeyPath)
+			}
+			keyBytes = b
+		}
+		cert, err := tls.X509KeyPair(certBytes, keyBytes)
+		if err != nil {
+			return errors.Annotatef(err, "parse cert/key pair")
+		}
+		tlsCfg.Certificates = []tls.Certificate{cert}
+	}
+
+	conf.Security.TLS = tlsCfg
 	return nil
 }
 
@@ -778,15 +817,3 @@ func adjustFileFormat(conf *Config) error {
 	return nil
 }
 
-func matchMysqlBugversion(info version.ServerInfo) bool {
-	// if 8.0.3 <= mysql8 version < 8.0.23
-	// FLUSH TABLES WITH READ LOCK could block other sessions from executing SHOW TABLE STATUS.
-	// see more in https://dev.mysql.com/doc/relnotes/mysql/8.0/en/news-8-0-23.html
-	if info.ServerType != version.ServerTypeMySQL {
-		return false
-	}
-	currentVersion := info.ServerVersion
-	bugVersionStart := semver.New("8.0.2")
-	bugVersionEnd := semver.New("8.0.23")
-	return bugVersionStart.LessThan(*currentVersion) && currentVersion.LessThan(*bugVersionEnd)
-}

@@ -14,7 +14,6 @@ import (
 	"github.com/pingcap/errors"
 	"github.com/pingcap/failpoint"
 	"github.com/pingcap/tidb/br/pkg/storage"
-	"github.com/pingcap/tidb/br/pkg/summary"
 	tcontext "github.com/tadapin/pg-dumpling/context"
 	"github.com/tadapin/pg-dumpling/log"
 	"github.com/prometheus/client_golang/prometheus"
@@ -205,8 +204,6 @@ func WriteInsert(
 				zap.String("table", meta.TableName()),
 				zap.Uint64("finished rows", counter),
 				zap.Uint64("finished size", wp.finishedFileSize))
-			summary.CollectSuccessUnit(summary.TotalBytes, 1, wp.finishedFileSize)
-			summary.CollectSuccessUnit("total rows", 1, counter)
 		}
 	}()
 
@@ -353,8 +350,6 @@ func WriteInsertInCsv(
 				zap.String("table", meta.TableName()),
 				zap.Uint64("finished rows", counter),
 				zap.Uint64("finished size", wp.finishedFileSize))
-			summary.CollectSuccessUnit(summary.TotalBytes, 1, wp.finishedFileSize)
-			summary.CollectSuccessUnit("total rows", 1, counter)
 		}
 	}()
 

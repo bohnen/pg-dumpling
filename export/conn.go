@@ -6,7 +6,7 @@ import (
 	"database/sql"
 
 	"github.com/pingcap/errors"
-	"github.com/pingcap/tidb/br/pkg/utils"
+	
 	tcontext "github.com/tadapin/pg-dumpling/context"
 	"go.uber.org/zap"
 )
@@ -31,7 +31,7 @@ func newBaseConn(conn *sql.Conn, shouldRetry bool, rebuildConnFn func(*sql.Conn,
 // QuerySQL defines query statement, and connect to real DB.
 func (conn *BaseConn) QuerySQL(tctx *tcontext.Context, handleOneRow func(*sql.Rows) error, reset func(), query string, args ...any) error {
 	retryTime := 0
-	err := utils.WithRetry(tctx, func() (err error) {
+	err := WithRetry(tctx, func() (err error) {
 		retryTime++
 		if retryTime > 1 && conn.rebuildConnFn != nil {
 			conn.DBConn, err = conn.rebuildConnFn(conn.DBConn, false)
@@ -56,7 +56,7 @@ func (conn *BaseConn) QuerySQL(tctx *tcontext.Context, handleOneRow func(*sql.Ro
 func (conn *BaseConn) QuerySQLWithColumns(tctx *tcontext.Context, columns []string, query string, args ...any) ([][]string, error) {
 	retryTime := 0
 	var results [][]string
-	err := utils.WithRetry(tctx, func() (err error) {
+	err := WithRetry(tctx, func() (err error) {
 		retryTime++
 		if retryTime > 1 && conn.rebuildConnFn != nil {
 			conn.DBConn, err = conn.rebuildConnFn(conn.DBConn, false)
@@ -87,7 +87,7 @@ func (conn *BaseConn) QuerySQLWithColumns(tctx *tcontext.Context, columns []stri
 // ExecSQL defines exec statement, and connect to real DB.
 func (conn *BaseConn) ExecSQL(tctx *tcontext.Context, canRetryFunc func(sql.Result, error) error, query string, args ...any) error {
 	retryTime := 0
-	err := utils.WithRetry(tctx, func() (err error) {
+	err := WithRetry(tctx, func() (err error) {
 		retryTime++
 		if retryTime > 1 && conn.rebuildConnFn != nil {
 			conn.DBConn, err = conn.rebuildConnFn(conn.DBConn, false)

@@ -3,9 +3,10 @@
 package export
 
 import (
+	"context"
 	"time"
 
-	"github.com/pingcap/tidb/br/pkg/utils"
+	"go.uber.org/multierr"
 )
 
 const (
@@ -14,8 +15,40 @@ const (
 	dumpChunkMaxWaitInterval = 200 * time.Millisecond
 )
 
+// Backoffer schedules retry attempts. Inlined from
+// github.com/pingcap/tidb/br/pkg/utils.Backoffer.
+type Backoffer interface {
+	// NextBackoff returns the duration to wait before the next attempt.
+	NextBackoff(err error) time.Duration
+	// Attempt returns how many attempts remain (zero or negative -> stop).
+	Attempt() int
+}
+
+// WithRetry runs fn until it returns nil, the Backoffer runs out of attempts,
+// or ctx is cancelled. The error from each failing attempt is accumulated
+// into a multierr so callers can inspect every cause.
+//
+// Inlined from github.com/pingcap/tidb/br/pkg/WithRetry minus
+// generic / SampleLogger flavour we don't use.
+func WithRetry(ctx context.Context, fn func() error, b Backoffer) error {
+	var allErrors error
+	for b.Attempt() > 0 {
+		err := fn()
+		if err == nil {
+			return nil
+		}
+		allErrors = multierr.Append(allErrors, err)
+		select {
+		case <-ctx.Done():
+			return allErrors
+		case <-time.After(b.NextBackoff(err)):
+		}
+	}
+	return allErrors
+}
+
 type backOfferResettable interface {
-	utils.Backoffer
+	Backoffer
 	Reset()
 }
 

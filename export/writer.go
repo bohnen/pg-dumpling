@@ -11,7 +11,7 @@ import (
 
 	"github.com/pingcap/errors"
 	"github.com/pingcap/tidb/br/pkg/storage"
-	"github.com/pingcap/tidb/br/pkg/utils"
+	
 	tcontext "github.com/tadapin/pg-dumpling/context"
 	"go.uber.org/zap"
 )
@@ -189,7 +189,7 @@ func (w *Writer) WriteTableData(meta TableMeta, ir TableDataIR, currentChunk int
 	tctx, conf, conn := w.tctx, w.conf, w.conn
 	retryTime := 0
 	var lastErr error
-	return utils.WithRetry(tctx, func() (err error) {
+	return WithRetry(tctx, func() (err error) {
 		defer func() {
 			lastErr = err
 			if err != nil {
@@ -214,7 +214,7 @@ func (w *Writer) WriteTableData(meta TableMeta, ir TableDataIR, currentChunk int
 		}
 		if conf.SQL != "" {
 			rows := ir.RawRows()
-			meta, err = setTableMetaFromRows(w.conf.ServerInfo.ServerType, rows)
+			meta, err = setTableMetaFromRows(rows)
 			if err != nil {
 				return err
 			}
@@ -285,7 +285,7 @@ func (w *Writer) writeMetaToFile(tctx *tcontext.Context, target, metaSQL string,
 	err = WriteMeta(tctx, &metaData{
 		target:   target,
 		metaSQL:  metaSQL,
-		specCmts: getSpecialComments(w.conf.ServerInfo.ServerType),
+		specCmts: getSpecialComments(),
 	}, fileWriter)
 	tearDownErr := tearDown(tctx)
 	if err == nil {

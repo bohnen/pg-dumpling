@@ -7,7 +7,6 @@ import (
 	"strings"
 
 	"github.com/pingcap/errors"
-	"github.com/pingcap/tidb/br/pkg/version"
 	tcontext "github.com/tadapin/pg-dumpling/context"
 	"go.uber.org/zap"
 )
@@ -398,4 +397,4 @@ var pgFilePreamble = []string{
 	"SET search_path = pg_catalog;",
 }
 
-func getSpecialComments(_ version.ServerType) []string { return pgFilePreamble }
+func getSpecialComments() []string { return pgFilePreamble }

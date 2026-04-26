@@ -17,7 +17,6 @@ import (
 	"github.com/pingcap/failpoint"
 	pclog "github.com/pingcap/log"
 	"github.com/pingcap/tidb/br/pkg/storage"
-	"github.com/pingcap/tidb/br/pkg/summary"
 	"github.com/tadapin/pg-dumpling/cli"
 	tcontext "github.com/tadapin/pg-dumpling/context"
 	"github.com/tadapin/pg-dumpling/log"
@@ -67,7 +66,7 @@ func NewDumper(ctx context.Context, conf *Config) (*Dumper, error) {
 
 	var err error
 
-	d.metrics = newMetrics(conf.PromFactory, conf.Labels)
+	d.metrics = newMetrics(conf.Labels)
 	d.metrics.registerTo(conf.PromRegistry)
 	defer func() {
 		if err != nil {
@@ -106,7 +105,7 @@ func (d *Dumper) Dump() (dumpErr error) {
 	tctx, conf, pool := d.tctx, d.conf, d.dbHandle
 	tctx.L().Info("begin to run Dump", zap.Stringer("conf", conf))
 	m := newGlobalMetadata(tctx, d.extStore, conf.Snapshot)
-	repeatableRead := needRepeatableRead(conf.ServerInfo.ServerType, conf.Consistency)
+	repeatableRead := needRepeatableRead(conf.Consistency)
 	defer func() {
 		if dumpErr == nil {
 			_ = m.writeGlobalMetaData()
@@ -142,7 +141,7 @@ func (d *Dumper) Dump() (dumpErr error) {
 	// for consistency flush, record snapshot after whole tables are locked. The recorded meta info is exactly the locked snapshot.
 	// for consistency snapshot, we should use the snapshot that we get/set at first in metadata. TiDB will assure the snapshot of TSO.
 	// for consistency none, the binlog pos in metadata might be earlier than dumped data. We need to enable safe-mode to assure data safety.
-	err = m.recordGlobalMetaData(metaConn, conf.ServerInfo, false)
+	err = m.recordGlobalMetaData(metaConn, false)
 	if err != nil {
 		tctx.L().Warn("get global metadata failed", log.ShortError(err))
 	}
@@ -167,7 +166,7 @@ func (d *Dumper) Dump() (dumpErr error) {
 		conn = newConn
 		// renew the master status after connection. dm can't close safe-mode until dm reaches current pos
 		if updateMeta && conf.PosAfterConnect {
-			err1 = m.recordGlobalMetaData(conn, conf.ServerInfo, true)
+			err1 = m.recordGlobalMetaData(conn, true)
 			if err1 != nil {
 				return conn, errors.Trace(err1)
 			}
@@ -209,15 +208,11 @@ func (d *Dumper) Dump() (dumpErr error) {
 
 	if conf.PosAfterConnect {
 		// record again, to provide a location to exit safe mode for DM
-		err = m.recordGlobalMetaData(metaConn, conf.ServerInfo, true)
+		err = m.recordGlobalMetaData(metaConn, true)
 		if err != nil {
 			tctx.L().Info("get global metadata (after connection pool established) failed", log.ShortError(err))
 		}
 	}
-
-	summary.SetLogCollector(summary.NewLogCollector(tctx.L().Info))
-	summary.SetUnit(summary.BackupUnit)
-	defer summary.Summary(summary.BackupUnit)
 
 	logProgressCtx, logProgressCancel := tctx.WithCancel()
 	go d.runLogProgress(logProgressCtx)
@@ -252,12 +247,12 @@ func (d *Dumper) Dump() (dumpErr error) {
 	})
 	_ = baseConn.DBConn.Close()
 	if err := wg.Wait(); err != nil {
-		summary.CollectFailureUnit("dump table data", err)
+		tctx.L().Error("dump table data failed", zap.Error(err))
 		return errors.Trace(err)
 	}
-	summary.CollectSuccessUnit("dump cost", countTotalTask(writers), time.Since(tableDataStartTime))
-
-	summary.SetSuccessStatus(true)
+	tctx.L().Info("dump finished",
+		zap.Int("totalTasks", countTotalTask(writers)),
+		zap.Duration("dumpCost", time.Since(tableDataStartTime)))
 	m.recordFinishTime(time.Now())
 	return nil
 }
@@ -267,7 +262,7 @@ func (d *Dumper) startWriters(tctx *tcontext.Context, wg *errgroup.Group, taskCh
 	conf, pool := d.conf, d.dbHandle
 	writers := make([]*Writer, conf.Threads)
 	for i := 0; i < conf.Threads; i++ {
-		conn, err := createConnWithConsistency(tctx, pool, needRepeatableRead(conf.ServerInfo.ServerType, conf.Consistency))
+		conn, err := createConnWithConsistency(tctx, pool, needRepeatableRead(conf.Consistency))
 		if err != nil {
 			return nil, func() {}, err
 		}
@@ -745,7 +740,7 @@ func dumpTableMeta(tctx *tcontext.Context, conf *Config, conn *BaseConn, db stri
 		selectedField:    selectField,
 		selectedLen:      selectLen,
 		hasImplicitRowID: hasImplicitRowID,
-		specCmts:         getSpecialComments(conf.ServerInfo.ServerType),
+		specCmts:         getSpecialComments(),
 	}
 
 	if conf.NoSchemas {

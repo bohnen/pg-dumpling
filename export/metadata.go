@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/pingcap/tidb/br/pkg/storage"
-	"github.com/pingcap/tidb/br/pkg/version"
 	tcontext "github.com/tadapin/pg-dumpling/context"
 )
 
@@ -48,17 +47,9 @@ func (m *globalMetadata) recordFinishTime(t time.Time) {
 	m.buffer.WriteString("Finished dump at: " + t.Format(metadataTimeLayout) + "\n")
 }
 
-func (m *globalMetadata) recordGlobalMetaData(db *sql.Conn, serverInfo version.ServerInfo, afterConn bool) error { // revive:disable-line:flag-parameter
-	if afterConn {
-		m.afterConnBuffer.Reset()
-		return recordGlobalMetaData(m.tctx, db, &m.afterConnBuffer, serverInfo, afterConn, m.snapshot)
-	}
-	return recordGlobalMetaData(m.tctx, db, &m.buffer, serverInfo, afterConn, m.snapshot)
-}
-
-// recordGlobalMetaData records server-side global metadata into buffer.
-// Phase 1 (pre-PG impl): no-op. Step 03 will record pg_current_wal_lsn() etc.
-func recordGlobalMetaData(_ *tcontext.Context, _ *sql.Conn, _ *bytes.Buffer, _ version.ServerInfo, _ bool, _ string) error {
+// recordGlobalMetaData records server-side global metadata. Currently a
+// no-op for PostgreSQL; a later step will add pg_current_wal_lsn().
+func (m *globalMetadata) recordGlobalMetaData(_ *sql.Conn, _ bool) error {
 	return nil
 }
 

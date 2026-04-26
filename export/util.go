@@ -2,10 +2,6 @@
 
 package export
 
-import (
-	"github.com/pingcap/tidb/br/pkg/version"
-)
-
 func string2Map(a, b []string) map[string]string {
 	a2b := make(map[string]string, len(a))
 	for i, str := range a {
@@ -15,8 +11,8 @@ func string2Map(a, b []string) map[string]string {
 }
 
 // needRepeatableRead reports whether dumping connections need REPEATABLE READ.
-// Always true for PostgreSQL snapshot consistency.
-func needRepeatableRead(_ version.ServerType, consistency string) bool {
+// True for PostgreSQL snapshot consistency.
+func needRepeatableRead(consistency string) bool {
 	return consistency == ConsistencyTypeSnapshot
 }
 
