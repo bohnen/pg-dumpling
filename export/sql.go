@@ -678,16 +678,32 @@ func pgMigrationCast(colName, dataType, udtName string, csvMode bool) string {
 		return "to_jsonb(" + q + ")::text" + alias
 	case "tsvector", "tsquery":
 		return "(" + q + ")::text" + alias
+	case "bit", "bit varying":
+		// PG returns the literal bit string ("1010"); explicit ::text so
+		// the row-receiver path treats it uniformly as a string column.
+		return "(" + q + ")::text" + alias
+	case "point", "line", "lseg", "box", "path", "polygon", "circle":
+		// Built-in geometric types. There's no meaningful MySQL/TiDB
+		// equivalent — emit PG's text form (e.g. '(1,2)' for point) so
+		// the value at least round-trips back to PG and lands as a string
+		// in MySQL/TiDB.
+		return "(" + q + ")::text" + alias
 	case "USER-DEFINED":
 		switch udtName {
 		case "int4range", "int8range", "numrange", "tsrange", "tstzrange",
 			"daterange", "int4multirange", "int8multirange", "nummultirange",
 			"tsmultirange", "tstzmultirange", "datemultirange":
 			return "to_jsonb(" + q + ")::text" + alias
+		case "hstore":
+			// Default ::text gives PG-specific "k"=>"v" form; convert to
+			// JSON instead so MySQL/TiDB JSON columns can ingest directly.
+			return "hstore_to_jsonb(" + q + ")::text" + alias
 		}
-		// Enums, pgvector (`vector`), hstore, custom domains: stringify.
+		// Enums, pgvector (`vector`), custom domains: stringify.
 		// pgvector's text form '[1,2,3]' is directly compatible with TiDB
-		// VECTOR.
+		// VECTOR. Composite types fall through here too — their ::text is
+		// PG's tuple form '(a,b,c)'; users wanting JSON should wrap with
+		// to_jsonb at the application/view layer.
 		return "(" + q + ")::text" + alias
 	}
 	return q

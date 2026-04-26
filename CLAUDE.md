@@ -22,6 +22,7 @@ TiDB のデータ移行ツール**として使えるようにすること。
 | `v0.4.0` | ✅ | Phase 2 完了: CSV server-side cast 21 型、テーブル内 chunk(数値 PK + ctid)、TiDB 内部依存 7→1、TiDB v8.5.6 への CSV 移行検証成功 |
 | `v0.5.0` | ✅ | Phase 3a: `replace ~/Work/tidb` 撤去。`github.com/pingcap/tidb` を public commit pin(`v1.1.0-beta.0.20260413061245-ae18096e0237` = v8.5.6)に切替 |
 | `v0.6.0` | ✅ | Phase 3: SQL 出力を MySQL/TiDB 向けに修正。`--target {mysql,tidb,pg}` を追加、デフォルト `mysql`。MySQL/TiDB 直叩きルート(`mysql -h … < dump.sql`)が確立 |
+| `v0.7.0` | ✅ | Phase 4a: PG 追加型 11 種(bit/varbit、geometric 7 種、hstore、composite フォールスルー)。総カバー 35+ 型 |
 
 ## ビルド & テスト
 
@@ -181,10 +182,21 @@ Phase 1 末で完全削除:
 - `proxy.golang.org` 経由で透明に解決され、初回 `go mod download` 後はキャッシュから取得
 - `replace` には TiDB 上流由来の非 TiDB 系(`apache/arrow-go`、`go-ldap`、`sourcegraph` 系)のみが残る
 
-## Phase 4 候補
+## Phase 4a 完了内容(v0.7.0)
+
+- **bit / bit varying**: `(col)::text` で文字列リテラル化(`'10101010'`)
+- **Geometric 7 種**(`point`/`line`/`lseg`/`box`/`path`/`polygon`/`circle`):
+  PG native 形式を文字列化(`'(1,2)'` 等)
+- **hstore**: `hstore_to_jsonb(col)::text` で JSON 化(target=mysql/tidb のとき)。
+  target=pg では native `"k"=>"v"` 維持
+- **composite types**: `::text` フォールスルー(PG タプル形式 `(a,b,c)` を文字列化)
+- e2e 検証: `postgres:17` ↔ `mysql:8.4` ↔ PG round-trip で 11 型 + 既存 21 型混在を確認
+- 詳細: `worklog/07-phase4a-additional-types.md`
+
+## Phase 4 残候補
 
 - **CI**(GitHub Actions: build + PG smoke + MySQL/TiDB smoke)
-- **PostGIS / hstore / tsvector** などの特殊型対応(現状 21 型カバー)
+- **PostGIS** `geometry`/`geography`(WKT/WKB の選択、SRID 扱い、外部依存)
 - **Parquet 出力**(上流 dumpling にも無いので必要性次第)
 
 MySQL 互換 SQL 出力モード(`--target=mysql/tidb` フラグ)は **採用しない**。
