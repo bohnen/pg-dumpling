@@ -481,9 +481,8 @@ func (d *Dumper) concurrentDumpTable(tctx *tcontext.Context, conn *BaseConn, met
 	}
 
 	field, err := pickupPossibleField(tctx, meta, conn)
-	if err != nil || field == "" {
-		// skip split chunk logic if not found proper field
-		tctx.L().Info("fallback to sequential dump due to no proper field. This won't influence the whole dump process",
+	if err != nil {
+		tctx.L().Info("fallback to sequential dump due to error finding chunking field",
 			zap.String("database", db), zap.String("table", tbl), log.ShortError(err))
 		return d.dumpWholeTableDirectly(tctx, meta, taskChan, "", orderByClause, 0, 1)
 	}
@@ -500,6 +499,18 @@ func (d *Dumper) concurrentDumpTable(tctx *tcontext.Context, conn *BaseConn, met
 			zap.Uint64("conf.rows", conf.Rows),
 			zap.String("database", db),
 			zap.String("table", tbl))
+		return d.dumpWholeTableDirectly(tctx, meta, taskChan, "", orderByClause, 0, 1)
+	}
+
+	// No integer PK / unique key — try a ctid range chunk instead.
+	if field == "" {
+		if done, err := d.concurrentDumpTableByCtid(tctx, conn, meta, taskChan, count, orderByClause); err != nil {
+			tctx.L().Info("ctid-range chunking failed, falling back to sequential",
+				zap.String("database", db), zap.String("table", tbl), log.ShortError(err))
+			return d.dumpWholeTableDirectly(tctx, meta, taskChan, "", orderByClause, 0, 1)
+		} else if done {
+			return nil
+		}
 		return d.dumpWholeTableDirectly(tctx, meta, taskChan, "", orderByClause, 0, 1)
 	}
 
@@ -526,13 +537,14 @@ func (d *Dumper) concurrentDumpTable(tctx *tcontext.Context, conn *BaseConn, met
 	selectField, selectLen := meta.SelectedField(), meta.SelectedLen()
 
 	chunkIndex := 0
+	qf := pgQuoteIdent(field)
 	nullValueCondition := ""
 	if conf.Where == "" {
-		nullValueCondition = fmt.Sprintf("`%s` IS NULL OR ", escapeString(field))
+		nullValueCondition = fmt.Sprintf("%s IS NULL OR ", qf)
 	}
 	for maxv.Cmp(cutoff) >= 0 {
 		nextCutOff := new(big.Int).Add(cutoff, bigEstimatedStep)
-		where := fmt.Sprintf("%s(`%s` >= %d AND `%s` < %d)", nullValueCondition, escapeString(field), cutoff, escapeString(field), nextCutOff)
+		where := fmt.Sprintf("%s(%s >= %d AND %s < %d)", nullValueCondition, qf, cutoff, qf, nextCutOff)
 		query := buildSelectQuery(db, tbl, selectField, "", buildWhereCondition(conf, where), orderByClause)
 		if len(nullValueCondition) > 0 {
 			nullValueCondition = ""
@@ -546,6 +558,70 @@ func (d *Dumper) concurrentDumpTable(tctx *tcontext.Context, conn *BaseConn, met
 		chunkIndex++
 	}
 	return nil
+}
+
+// concurrentDumpTableByCtid splits a heap table into chunks of contiguous
+// ctid ranges. Each row in a heap has a (block_number, item_offset) ctid; we
+// chunk by block_number ranges. The strategy works for any regular heap
+// table and is the natural choice when no integer PK is available.
+//
+// Returns (true, nil) if it dispatched chunk tasks; (false, nil) when there
+// were no rows (caller can fall back); (_, err) on errors.
+func (d *Dumper) concurrentDumpTableByCtid(tctx *tcontext.Context, conn *BaseConn, meta TableMeta, taskChan chan<- Task, count uint64, orderByClause string) (bool, error) {
+	conf := d.conf
+	db, tbl := meta.DatabaseName(), meta.TableName()
+
+	// total block pages
+	const blocksQ = `
+SELECT (pg_relation_size($1::regclass) /
+        current_setting('block_size')::int)::bigint AS pages`
+	var pages int64
+	err := conn.QuerySQL(tctx, func(rows *sql.Rows) error {
+		return rows.Scan(&pages)
+	}, func() { pages = 0 }, blocksQ, fmt.Sprintf("%s.%s", db, tbl))
+	if err != nil {
+		return false, err
+	}
+	if pages <= 0 {
+		return false, nil
+	}
+
+	// Aim for chunks of conf.Rows, mapping rows back to pages via the
+	// global density (count / pages). Round up so we never produce a
+	// 0-page chunk; cap at the total page count.
+	estChunks := int64(count / conf.Rows)
+	if estChunks < 1 {
+		estChunks = 1
+	}
+	step := pages / estChunks
+	if step < 1 {
+		step = 1
+	}
+	if step > pages {
+		step = pages
+	}
+	totalChunks := int((pages + step - 1) / step)
+
+	selectField, selectLen := meta.SelectedField(), meta.SelectedLen()
+	chunkIndex := 0
+	for blockStart := int64(0); blockStart < pages; blockStart += step {
+		blockEnd := blockStart + step
+		// Last chunk: include +inf so any rows added after we read the
+		// page count still get picked up.
+		var where string
+		if blockEnd >= pages {
+			where = fmt.Sprintf("ctid >= '(%d,0)'", blockStart)
+		} else {
+			where = fmt.Sprintf("ctid >= '(%d,0)' AND ctid < '(%d,0)'", blockStart, blockEnd)
+		}
+		query := buildSelectQuery(db, tbl, selectField, "", buildWhereCondition(conf, where), orderByClause)
+		task := d.newTaskTableData(meta, newTableData(query, selectLen, false), chunkIndex, totalChunks)
+		if ctxDone := d.sendTaskToChan(tctx, task, taskChan); ctxDone {
+			return true, tctx.Err()
+		}
+		chunkIndex++
+	}
+	return true, nil
 }
 
 func (d *Dumper) sendTaskToChan(tctx *tcontext.Context, task Task, taskChan chan<- Task) (ctxDone bool) {
@@ -562,8 +638,9 @@ func (d *Dumper) sendTaskToChan(tctx *tcontext.Context, task Task, taskChan chan
 
 func (d *Dumper) selectMinAndMaxIntValue(tctx *tcontext.Context, conn *BaseConn, db, tbl, field string) (*big.Int, *big.Int, error) {
 	conf, zero := d.conf, &big.Int{}
-	query := fmt.Sprintf("SELECT MIN(`%s`),MAX(`%s`) FROM `%s`.`%s`",
-		escapeString(field), escapeString(field), escapeString(db), escapeString(tbl))
+	qf := pgQuoteIdent(field)
+	query := fmt.Sprintf("SELECT MIN(%s),MAX(%s) FROM %s",
+		qf, qf, pgQuoteQName(db, tbl))
 	if conf.Where != "" {
 		query = fmt.Sprintf("%s WHERE %s", query, conf.Where)
 	}
@@ -699,8 +776,11 @@ func (d *Dumper) dumpSQL(tctx *tcontext.Context, metaConn *BaseConn, taskChan ch
 	meta := &tableMeta{}
 	data := newTableData(conf.SQL, 0, true)
 	task := d.newTaskTableData(meta, data, 0, 1)
-	c := detectEstimateRows(tctx, metaConn, fmt.Sprintf("EXPLAIN %s", conf.SQL), []string{"rows", "estRows", "count"})
-	AddCounter(d.metrics.estimateTotalRowsCounter, float64(c))
+	// Custom --sql path: we don't try to estimate row counts in PG mode.
+	// EXPLAIN parsing differs from MySQL's, and the metric is only used
+	// for an early progress hint, so 0 is a safe default.
+	AddCounter(d.metrics.estimateTotalRowsCounter, 0)
+	_ = metaConn
 	atomic.StoreInt64(&d.totalTables, int64(1))
 	d.sendTaskToChan(tctx, task, taskChan)
 }

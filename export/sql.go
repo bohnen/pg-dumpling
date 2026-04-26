@@ -9,13 +9,11 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"strconv"
 	"strings"
 
 	"github.com/pingcap/errors"
 	"github.com/pingcap/failpoint"
 	tcontext "github.com/tadapin/pg-dumpling/context"
-	"github.com/tadapin/pg-dumpling/log"
 	"go.uber.org/zap"
 )
 
@@ -424,11 +422,50 @@ ORDER BY array_position(i.indkey, a.attnum)`
 	return cols, nil
 }
 
-// getNumericIndex picks an integer-typed column from PRIMARY/unique indexes
-// for use as a chunking key. Phase 1 returns "" so callers fall back to
-// sequential dumping. Phase 2 will revive ctid- or PK-range chunking.
-func getNumericIndex(_ *tcontext.Context, _ *BaseConn, _ TableMeta) (string, error) {
-	return "", nil
+// getNumericIndex picks an integer-typed column suitable as a chunking key.
+//
+// Priority:
+//  1. Single-column PRIMARY KEY whose column type is int2 / int4 / int8.
+//  2. Single-column UNIQUE index whose column type is int2 / int4 / int8.
+//  3. "" — caller falls back to sequential dump (or ctid range, future).
+//
+// Multi-column keys are skipped: range-splitting on a composite key would
+// either over-dump (Cartesian seam rows) or require per-prefix sub-queries,
+// and the speed-up is rarely worth the cost. Pick a UNIQUE single-int
+// instead, or accept the sequential path.
+func getNumericIndex(tctx *tcontext.Context, db *BaseConn, meta TableMeta) (string, error) {
+	const q = `
+WITH idx AS (
+  SELECT i.indexrelid,
+         i.indisprimary,
+         i.indkey,
+         array_length(i.indkey, 1) AS keylen
+    FROM pg_catalog.pg_index i
+    JOIN pg_catalog.pg_class c ON c.oid = i.indrelid
+    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+   WHERE n.nspname = $1 AND c.relname = $2
+     AND (i.indisprimary OR i.indisunique)
+     AND array_length(i.indkey, 1) = 1
+)
+SELECT a.attname, format_type(a.atttypid, a.atttypmod), idx.indisprimary
+  FROM idx
+  JOIN pg_catalog.pg_attribute a ON a.attrelid = (
+        SELECT i2.indrelid FROM pg_catalog.pg_index i2
+         WHERE i2.indexrelid = idx.indexrelid)
+   AND a.attnum = idx.indkey[0]
+ WHERE format_type(a.atttypid, 0) IN ('smallint','integer','bigint')
+ ORDER BY idx.indisprimary DESC, a.attname
+ LIMIT 1`
+	results, err := db.QuerySQLWithColumns(tctx,
+		[]string{"attname", "type", "is_primary"},
+		q, meta.DatabaseName(), meta.TableName())
+	if err != nil {
+		return "", err
+	}
+	if len(results) == 0 {
+		return "", nil
+	}
+	return results[0][0], nil
 }
 
 // GetSpecifiedColumnValueAndClose get columns' values whose name is equal to columnName and close the given rows
@@ -888,95 +925,30 @@ func pickupPossibleField(tctx *tcontext.Context, meta TableMeta, db *BaseConn) (
 	return fieldName, nil
 }
 
-func estimateCount(tctx *tcontext.Context, dbName, tableName string, db *BaseConn, field string, conf *Config) uint64 {
-	var query string
-	qname := pgQuoteQName(dbName, tableName)
-	if strings.TrimSpace(field) == "*" || strings.TrimSpace(field) == "" {
-		query = fmt.Sprintf("EXPLAIN SELECT * FROM %s", qname)
-	} else {
-		query = fmt.Sprintf("EXPLAIN SELECT %s FROM %s", pgQuoteIdent(field), qname)
-	}
-
-	if conf.Where != "" {
-		query += " WHERE "
-		query += conf.Where
-	}
-
-	estRows := detectEstimateRows(tctx, db, query, []string{"rows", "estRows", "count"})
-	/* tidb results field name is estRows (before 4.0.0-beta.2: count)
-		+-----------------------+----------+-----------+---------------------------------------------------------+
-		| id                    | estRows  | task      | access object | operator info                           |
-		+-----------------------+----------+-----------+---------------------------------------------------------+
-		| tablereader_5         | 10000.00 | root      |               | data:tablefullscan_4                    |
-		| └─tablefullscan_4     | 10000.00 | cop[tikv] | table:a       | table:a, keep order:false, stats:pseudo |
-		+-----------------------+----------+-----------+----------------------------------------------------------
-
-	mariadb result field name is rows
-		+------+-------------+---------+-------+---------------+------+---------+------+----------+-------------+
-		| id   | select_type | table   | type  | possible_keys | key  | key_len | ref  | rows     | Extra       |
-		+------+-------------+---------+-------+---------------+------+---------+------+----------+-------------+
-		|    1 | SIMPLE      | sbtest1 | index | NULL          | k_1  | 4       | NULL | 15000049 | Using index |
-		+------+-------------+---------+-------+---------------+------+---------+------+----------+-------------+
-
-	mysql result field name is rows
-		+----+-------------+-------+------------+-------+---------------+-----------+---------+------+------+----------+-------------+
-		| id | select_type | table | partitions | type  | possible_keys | key       | key_len | ref  | rows | filtered | Extra       |
-		+----+-------------+-------+------------+-------+---------------+-----------+---------+------+------+----------+-------------+
-		|  1 | SIMPLE      | t1    | NULL       | index | NULL          | multi_col | 10      | NULL |    5 |   100.00 | Using index |
-		+----+-------------+-------+------------+-------+---------------+-----------+---------+------+------+----------+-------------+
-	*/
-	if estRows > 0 {
-		return estRows
-	}
-	return 0
-}
-
-func detectEstimateRows(tctx *tcontext.Context, db *BaseConn, query string, fieldNames []string) uint64 {
-	var (
-		fieldIndex int
-		oneRow     []sql.NullString
-	)
+// estimateCount returns a fast row-count estimate for the table by reading
+// pg_class.reltuples, which the planner keeps fresh enough for chunking
+// decisions (autovacuum / ANALYZE updates it). For an empty table or a
+// freshly-created one without statistics, reltuples is 0 and we return 0.
+//
+// `field` and `conf.Where` are accepted for API compatibility with the
+// legacy MySQL flavour but ignored — pg_class.reltuples is a whole-table
+// estimate.
+func estimateCount(tctx *tcontext.Context, dbName, tableName string, db *BaseConn, _ string, _ *Config) uint64 {
+	const q = `
+SELECT GREATEST(c.reltuples, 0)::bigint
+FROM pg_catalog.pg_class c
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = $1 AND c.relname = $2`
+	var n int64
 	err := db.QuerySQL(tctx, func(rows *sql.Rows) error {
-		columns, err := rows.Columns()
-		if err != nil {
-			return errors.Trace(err)
-		}
-		addr := make([]any, len(columns))
-		oneRow = make([]sql.NullString, len(columns))
-		fieldIndex = -1
-	found:
-		for i := range oneRow {
-			for _, fieldName := range fieldNames {
-				if strings.EqualFold(columns[i], fieldName) {
-					fieldIndex = i
-					break found
-				}
-			}
-		}
-		if fieldIndex == -1 {
-			rows.Close()
-			return nil
-		}
-
-		for i := range oneRow {
-			addr[i] = &oneRow[i]
-		}
-		return rows.Scan(addr...)
-	}, func() {}, query)
-	if err != nil || fieldIndex == -1 {
-		tctx.L().Info("can't estimate rows from db",
-			zap.String("query", query), zap.Int("fieldIndex", fieldIndex), log.ShortError(err))
+		return rows.Scan(&n)
+	}, func() { n = 0 }, q, dbName, tableName)
+	if err != nil || n < 0 {
 		return 0
 	}
-
-	estRows, err := strconv.ParseFloat(oneRow[fieldIndex].String, 64)
-	if err != nil {
-		tctx.L().Info("can't get parse estimate rows from db",
-			zap.String("query", query), zap.String("estRows", oneRow[fieldIndex].String), log.ShortError(err))
-		return 0
-	}
-	return uint64(estRows)
+	return uint64(n)
 }
+
 
 func buildWhereCondition(conf *Config, where string) string {
 	var query strings.Builder
