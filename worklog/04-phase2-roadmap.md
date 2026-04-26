@@ -1,180 +1,217 @@
-# 04 — Phase 2 roadmap: PostgreSQL → MySQL / TiDB データ移行
+# 04 — Phase 2 roadmap: 中間フォーマットによる PG → TiDB 移行
 
 - 日付: 2026-04-26
 - 担当: tadatoshi.sekiguchi@pingcap.com (with Claude)
 - 状態: 計画。実装着手前
 
+## 方針(2026-04-26 確定)
+
+Phase 2 は **CSV / Parquet 等の中間フォーマット**を一級市民として整備し、それを
+ローダ(TiDB Lightning 等)経由で TiDB / MySQL に取り込む経路を実用化することを
+ゴールとする。
+
+直接ロード可能な「MySQL 互換 SQL」を吐く方向は **採用しない**:
+
+- PG ↔ MySQL の非互換は型・関数・SQL_MODE・トランザクション・予約語・大文字小文字・
+  TZ 取り扱いに渡って多岐にわたり、`SET …` 一発では揃わない
+- 中間フォーマットなら型変換ロジックがシンプル(serializer 1 箇所に集中)で、
+  ローダ側のバグ修正・最適化の恩恵を受けられる
+- TiDB Lightning は CSV / Parquet をネイティブに受けられる
+
+`--target=postgres` フラグは不要(用途は `pg_dump` でカバー済み)。SQL 出力モードは
+小規模 round-trip / デバッグ用として現状を維持するが、移行用途では使わない。
+
 ## ゴール
 
-Phase 1(`v0.3.0-postgres`)で「PG → dumpling 形式 → PG」の round-trip が成立した。
-Phase 2 のメインゴールは **PG → MySQL/TiDB のデータ移行ツールとして実用化**する
-こと。具体的には:
+1. **CSV を TiDB Lightning に流せる品質に**(PG 固有型の安全な文字列化、
+   `\N` NULL、適切なバイナリ表現)
+2. **Parquet 出力を追加**(`--filetype parquet`)、PG 型 → Parquet 論理型の
+   素直なマッピング
+3. **テーブル内 chunking 復活**(数値 PK レンジ / ctid レンジ / partition 子表)
+4. **`replace ~/Work/tidb` の解消**(完全独立モジュール化)
+5. ドキュメント整備と `v0.4.0` リリース
 
-1. **重要マイルストーン**: PG から取得したデータを TiDB(または MySQL)に
-   import できる
-2. **テーブル内 chunking** を復活させ、`--threads` 並列性をテーブル数より細かく
-   活かせるようにする
-3. **`replace ~/Work/tidb` を消す**(完全独立リポジトリ化)
-4. **CI** で PG round-trip と PG → TiDB smoke を自動実行
+CI は Phase 3 に送る。
 
-## 動機(Phase 1 末に判明したギャップ)
+## 課題 1: CSV を「移行用 CSV」として完成させる
 
-Phase 1 で Docker `mysql:8.4` に PG ダンプをロードしようとして得た現実:
+現在の CSV は文字列を `"..."` で囲んだ素朴な形式。Phase 2 で TiDB Lightning や
+`mysql --local-infile` から取り込めるように整える。
 
+### サーバ側 cast による型の文字列化
+
+PG カタログから取り出した `data_type` / `udt_name` を見て、`buildSelectQuery` が
+**SELECT 句で型ごとに cast を仕込む**:
+
+| PG 型 | SELECT 句に入る式 | CSV セル |
+|---|---|---|
+| `timestamptz` | `to_char(col AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS.US')` | `2026-04-26 12:00:00.000000` |
+| `timestamp` | `to_char(col, 'YYYY-MM-DD HH24:MI:SS.US')` | 同上(TZ 無し) |
+| `date` | `to_char(col, 'YYYY-MM-DD')` | `2026-04-26` |
+| `time`、`timetz` | `to_char(col, 'HH24:MI:SS.US')` | `12:00:00.000000` |
+| `interval` | `EXTRACT(EPOCH FROM col)::numeric` | 秒数(浮動小数) |
+| `bool` | `(col)::int` | `0` / `1` |
+| `bytea` | `encode(col, 'hex')` | 16 進文字列(MySQL の `UNHEX(col)` 列に投入可) |
+| `uuid` | `(col)::text` | `xxxx-xxxx-...` |
+| `json`、`jsonb` | `(col)::text` | JSON 文字列 |
+| `inet`、`cidr`、`macaddr` | `(col)::text` | 文字列 |
+| 配列(`_int4` 等) | `to_jsonb(col)::text` | JSON 配列 |
+| range / multirange | `to_jsonb(col)::text` | JSON `{"l":..,"u":..,"li":..,"ui":..}` |
+| ユーザ定義 enum | `(col)::text` | ラベル文字列 |
+| `tsvector`、`tsquery` | `(col)::text` | PG リテラル形式(検索性は失う) |
+| `numeric` | そのまま | 文字列(精度を保つ) |
+
+実装:
+
+- `export/sql.go` の `buildSelectQuery` を `buildPgSelectExpr(colName, dataType, udtName)` 経由に。
+- 型情報は `information_schema.columns` から `data_type` と `udt_name` を取って
+  `meta TableMeta` に積む(現状 `colTypes` は `*sql.ColumnType` のみ)。
+- pgx の `*sql.ColumnType.DatabaseTypeName()` でも分かるが、配列 / range の
+  細部は `udt_name` から起こす方が確実。
+
+### CSV のオプション整理
+
+- **ヘッダ**: 既定 ON、`--no-header` で OFF(現状維持)
+- **delimiter / separator / line terminator**: 現状維持
+- **NULL 表記**: 既定 `\N`、Lightning 互換のため `--csv-null-value` で変更可(現状維持)
+- **新規: `--csv-binary-format {hex,base64,raw}`**: bytea/binary 表現の切替(既定 `hex`)。
+  raw は CSV 内に生バイトを置くので escape の責任が重く非推奨だが互換のため残す。
+- **新規: `--csv-zero-based-bool`**: bool を `t/f` ではなく `1/0` で書く(既定有効、TiDB Lightning 向け)。
+
+### CSV 検証(Phase 2 完了条件)
+
+```sh
+docker run -d --name pg postgres:17 ...
+docker run -d --name tidb pingcap/tidb:nightly ...   # or use Zero
+psql -d demo -f - <<SQL
+CREATE TABLE t (
+  id int primary key,
+  s text, j jsonb, ts timestamptz, b bytea, u uuid, arr int[]
+);
+INSERT INTO t VALUES (1, 'hello', '{"a":1}', now(), '\xDE\xAD',
+                      gen_random_uuid(), ARRAY[1,2,3]);
+SQL
+pg-dumpling ... --filetype csv -o /tmp/csv
+# Lightning で取り込み
+tidb-lightning --backend tidb --data-source-dir /tmp/csv --... 
+# row count + 全カラム照合
 ```
-$ mysql -uroot < /tmp/pg2my/public.simple.000000000.sql
-ERROR 1193 (HY000) at line 1: Unknown system variable 'standard_conforming_strings'
+
+## 課題 2: Parquet 出力
+
+`--filetype parquet` を追加。dumpling の writer pipeline を再利用しつつ、
+serializer だけ Parquet writer に差し替える。
+
+### ライブラリ選定
+
+第一候補: `github.com/apache/arrow-go/v18`(`replace` 経由で TiDB go.mod から既に
+読み込まれているので追加負荷ゼロ)。
+
+代替案: `github.com/parquet-go/parquet-go`(arrow 依存なし、軽量)。Phase 2 で
+評価して決める。
+
+### スキーマ導出
+
+`information_schema.columns` + `pg_type` の情報から Parquet schema を構築:
+
+| PG 型 | Parquet 物理型 | logical type | 備考 |
+|---|---|---|---|
+| `int2` / `int4` | INT32 | INT(16/32, signed=true) | |
+| `int8` | INT64 | INT(64, signed=true) | |
+| `float4` | FLOAT | — | |
+| `float8` | DOUBLE | — | |
+| `numeric(p,s)` | FIXED_LEN_BYTE_ARRAY 等 | DECIMAL(p,s) | precision 不明時は STRING にフォールバック |
+| `bool` | BOOLEAN | — | |
+| `text` / `varchar` / `char` / `name` | BYTE_ARRAY | STRING(UTF8) | |
+| `bytea` | BYTE_ARRAY | — | バイナリそのまま |
+| `uuid` | FIXED_LEN_BYTE_ARRAY(16) | UUID | 16 バイト直値 |
+| `date` | INT32 | DATE | エポック日数 |
+| `time(tz)` | INT64 | TIME(MICROS, isAdjustedToUTC) | TZ は UTC 化 |
+| `timestamp` | INT64 | TIMESTAMP(MICROS, isAdjustedToUTC=false) | |
+| `timestamptz` | INT64 | TIMESTAMP(MICROS, isAdjustedToUTC=true) | UTC 化済 |
+| `interval` | INT64(秒) | — or BYTE_ARRAY(STRING) | 設計時に確定 |
+| `inet` / `cidr` / `macaddr` | BYTE_ARRAY | STRING | |
+| `json` / `jsonb` | BYTE_ARRAY | JSON | |
+| 配列・range・enum | BYTE_ARRAY | JSON | server-side `to_jsonb(col)::text` で取得 |
+
+NULL は Parquet 標準のリピート/optional レベルで表現。
+
+### ストリーミング書き出し
+
+`writer_util.go` のチャンク境界(`--filesize`)に合わせて Parquet ファイルを切る。
+1 ファイル = 1 row group としてシンプルに開始し、性能課題が出たら row group 単位
+に細分化する。圧縮は `--compress {snappy,zstd,gzip}` を Parquet codec に
+マッピング(既定 `snappy`)。
+
+### 検証(Phase 2 完了条件)
+
+```sh
+pg-dumpling ... --filetype parquet -o /tmp/pq
+parquet-tools schema /tmp/pq/public.t.000000000.parquet
+parquet-tools cat   /tmp/pq/public.t.000000000.parquet | head
+# TiDB Lightning に Parquet 取り込み(対応バージョン要確認)
+tidb-lightning --backend tidb --data-source-dir /tmp/pq ...
 ```
-
-INSERT ブロック先頭の preamble 3 行(`SET standard_conforming_strings = on;` 等)
-が MySQL で全部弾かれる。INSERT 自体に到達せず、データはゼロ件入る。
-「とりあえずそのまま流す」が成り立たないため、ターゲット dialect を意識した
-**マルチターゲット出力**を Phase 2 で実装する必要がある。
-
-これは preamble だけでなく、識別子クォート・リテラル・型表現すべてに波及する。
-
-## 課題 1: マルチターゲット出力 dialect
-
-新フラグ案: `--target {postgres,mysql,tidb}`(default `postgres`)。
-
-| 項目 | `--target=postgres` | `--target=mysql` | `--target=tidb` |
-|---|---|---|---|
-| Preamble | `SET standard_conforming_strings = on; SET client_encoding = 'UTF8'; SET search_path = pg_catalog;` | `/*!40101 SET NAMES utf8mb4*/; /*!40014 SET FOREIGN_KEY_CHECKS=0*/;` | `/*!40101 SET NAMES utf8mb4*/; /*!40014 SET FOREIGN_KEY_CHECKS=0*/;` + 必要なら TiDB 専用 hint |
-| 識別子クォート | `"col"` | `` `col` `` | `` `col` `` |
-| 文字列エスケープ | `''` 二重化のみ | バックスラッシュ + `''` 二重化(MySQL 流) | 同 MySQL |
-| BYTEA リテラル | `'\xDEADBEEF'` | `x'DEADBEEF'` または `0xDEADBEEF` | 同 MySQL |
-| BOOL | `true` / `false` | `1` / `0` | `1` / `0` |
-| TIMESTAMPTZ | `'2026-04-26T21:00:00+09:00'` | TZ 情報を切り捨てて `'2026-04-26 12:00:00'`(UTC 化) | 同 MySQL |
-| JSONB | `'{"a":1}'` | `'{"a":1}'`(target カラムが JSON 型なら可) | 同 MySQL |
-| INTERVAL | `'1 day 02:03:04'` | 文字列 or 秒数(target 仕様に依存) | 同 MySQL |
-| 配列・レンジ・enum | 文字列 | JSON 文字列化 or 別表展開 | 同 MySQL |
-| ファイル拡張子 / 命名 | 既存どおり | 既存どおり | 既存どおり |
-
-**実装方針**:
-
-- `export/dialect.go` に `type Dialect interface` を切る — まず enum + switch で
-  始め、interface 化は分岐が増えてから
-- `pgQuoteIdent` を `Dialect.QuoteIdent(name)` に置き換え
-- `escapeSQL` / `SQLTypeBytes.WriteToBuffer` 等を Dialect 経由で
-- preamble は `getSpecialComments(target)` に
-- `MakeRowReceiver` が型に応じて Dialect を考慮した receiver を返す(BOOL の
-  `t/f` → `1/0` 変換等)
-
-## 課題 2: PG 固有型のロード可能化
-
-PG → TiDB import で必要になる型変換。`--target=tidb` 時に dumper 側で実施するか、
-あるいは TiDB Lightning 等の loader 側で対応するかは選択肢があるが、まず
-**dumper 側で SQL リテラルを互換化**する方向で考える(loader を限定したくない)。
-
-| PG 型 | 想定する TiDB 側カラム | dumper の挙動 | 備考 |
-|---|---|---|---|
-| `int2`、`int4`、`int8` | `SMALLINT`、`INT`、`BIGINT` | そのまま数値 | OK |
-| `numeric(p,s)` | `DECIMAL(p,s)` | そのまま数値 | OK |
-| `float4`、`float8` | `FLOAT`、`DOUBLE` | そのまま数値 | NaN/Inf は `'NaN'` 文字列 → 要対応 |
-| `bool` | `TINYINT(1)` | `t`/`f` を `1`/`0` に | dialect マトリクス |
-| `text`、`varchar`、`char`、`uuid` | `TEXT`、`VARCHAR`、`CHAR(36)` | `'...'` (バックスラッシュエスケープ on) | エスケープ規則を target に合わせる |
-| `bytea` | `VARBINARY`、`BLOB` | `x'HEX'` | dialect マトリクス |
-| `date`、`time` | `DATE`、`TIME` | `'YYYY-MM-DD'` / `'HH:MM:SS'` | 6 桁の小数秒は MySQL も TIME(6) で OK |
-| `timestamp` | `DATETIME`(6) | `'YYYY-MM-DD HH:MM:SS.ffffff'` | OK |
-| `timestamptz` | `TIMESTAMP`(6) | UTC に正規化して `'YYYY-MM-DD HH:MM:SS'` | TZ を捨てる旨をログに |
-| `interval` | `INT`(秒) or `VARCHAR` | `EXTRACT(EPOCH FROM ...)` 換算 or 文字列 | デフォルト動作要決定 |
-| `json`、`jsonb` | `JSON` | `'…'` をそのまま | OK(MySQL/TiDB は JSON 型サポート) |
-| `inet`、`cidr` | `VARCHAR(43)` | 文字列化 | OK |
-| `macaddr`、`macaddr8` | `VARCHAR(17/23)` | 文字列化 | OK |
-| `_int4` 等の配列 | `JSON` | `array_to_json(col)::text` で取り出し | Phase 2 中盤 |
-| range/multirange(`int4range`、`tstzrange` 等) | `JSON`(`{"l":..,"u":..}`) | server 側 cast or client 側変換 | Phase 2 中盤 |
-| ユーザ定義 enum | `VARCHAR` or `ENUM(...)` | 文字列化 | OK |
-| `tsvector`、`tsquery` | `TEXT` | 文字列化 | 検索性は失われる、ドキュメント化 |
-| `geometry`(PostGIS) | TiDB の地理関数なし | `ST_AsEWKB(col)::bytea` で取り出し → `JSON` 等 | 別ユースケース、後回し |
-| `hstore` | `JSON` | `hstore_to_json(col)` を SELECT 側で適用 | 後回し |
-| 配列の配列、ドメイン型 | ケースバイケース | ベース型に再帰 | 後回し |
-
-**実装方針**:
-
-- 受信器を 3 種(Number/String/Bytes)から拡張: `SQLTypeBool`、`SQLTypeTimestampTZ`、`SQLTypeInterval`、`SQLTypeArray`、`SQLTypeRange` 等
-- 型 map(`colTypeRowReceiverMap`)を `--target` で枝分けせず、受信器内部で
-  target を見て分岐(現状の `escapeBackslash bool` パラメータ流儀の拡張)
-- 配列 / range / hstore / PostGIS は **SELECT 側で server-side cast** が単純:
-  `SELECT col1, array_to_json(arr_col)::text AS arr_col, ...` を `buildSelectQuery`
-  に組み込む。`information_schema.columns` の `data_type` を読むだけで分岐可能
 
 ## 課題 3: テーブル内 chunking の復活
 
-Phase 1 では `getNumericIndex` が空文字を返し、テーブル内 chunk は無効化。
-Phase 2 で復活させる:
+Phase 1 で `getNumericIndex` を空文字返却にした穴を塞ぐ。
 
-1. **数値 PK レンジ chunk**(優先度高、上流 dumpling と互換)
-   - `getNumericIndex` を PG 用に再実装: `pg_index` で PK / unique を取得 →
-     `pg_attribute` から型確認 → 整数型なら採用
-   - 既存の `getMinMax` / `splitTableWithIndex` をそのまま流用(クォート修正のみ)
+1. **数値 PK レンジ chunk**(優先度高)
+   - `pg_index` で PK / unique 取得 → `pg_attribute` 経由で型確認 → 整数型なら採用
+   - 既存の `getMinMax` / `splitTableWithIndex` をクォート修正だけで流用
    - `--rows N` フラグの no-op を解除
 
-2. **`ctid` レンジ chunk**(PG 特有、PK が無いテーブル向け)
+2. **`ctid` レンジ chunk**(PK 無しテーブル向け、PG 特有)
    - `pg_relation_size / current_setting('block_size')::int` でブロック数を推定
-   - `ctid >= '(START,0)' AND ctid < '(END,0)'` で WHERE 構築
+   - `WHERE ctid >= '(s,0)' AND ctid < '(e,0)'` で WHERE 構築
    - `pg_dump --jobs N` と同じ手法
 
-3. **partitioned table の partition 単位 fan-out**(`pg_inherits` 子表)
-   - `GetPartitionNames` は既に Phase 1 で実装済み
-   - `concurrentDumpTable` から partition ごとに dump task を発行する経路を復活
+3. **partition 単位 fan-out**
+   - `GetPartitionNames` は Phase 1 で既に PG 用に書き直し済み
+   - `concurrentDumpTable` から partition ごとに dump task 発行する経路を復活
 
 ## 課題 4: `replace ~/Work/tidb` の解消
 
-`go.mod` から `replace` を消すには、現在 import している以下を `internal/` に
-取り込むか書き直す必要がある:
+`go.mod` から `replace github.com/pingcap/tidb => ...` を消すには現在依存している
+以下を `internal/` に取り込むか書き直す:
 
-| 依存 | 現用途 | 取り込み方針 |
+| 依存 | 用途 | 取り込み方針 |
 |---|---|---|
-| `br/pkg/storage` | S3/GCS/Azure 抽象 | そのままコピー(BSL 互換は問題なし、Apache 2.0) |
-| `br/pkg/utils` | retry helper | `WithRetry` 関数 1 個だけ、自前実装で代替 |
-| `br/pkg/summary` | progress 集計 | コピー or 簡素化(zap log で十分という選択もあり) |
-| `pkg/util/table-filter` | `--filter` 解析 | コピー(独立性の高いパッケージ) |
+| `br/pkg/storage` | S3/GCS/Azure 抽象 | そのままコピー(Apache 2.0) |
+| `br/pkg/utils` | retry helper | `WithRetry` 1 関数のみ自前実装で代替 |
+| `br/pkg/summary` | progress 集計 | コピー or zap log 化で簡素化 |
+| `pkg/util/table-filter` | `--filter` 解析 | コピー(独立性高) |
 | `pkg/util/promutil` | metrics ファクトリ | コピー(数行) |
 | `pkg/util` | `SliceKeysQuoted` 等 | 必要関数のみ inline |
 
-これで `replace github.com/pingcap/tidb => /Users/bohnen/Work/tidb` を削除し、
-**完全独立な Go モジュール**になる。CI もこれを前提にできる。
+これで完全独立モジュールになり、外部に push 可能になる。
 
-## 課題 5: CI(GitHub Actions)
+## 着手順序
 
-`.github/workflows/ci.yml` で:
+1. **04a — CSV ハードニング**: 型ごとの SELECT 句 cast、`--csv-binary-format`
+   等のオプション、テストデータでの round-trip 確認
+2. **04b — Parquet バックエンド**: `--filetype parquet` のスキーマ導出 + writer
+3. **04c — テーブル内 chunk 復活**: 数値 PK → ctid → partition fan-out
+4. **04d — TiDB 依存解消**: `replace` 削除、`internal/` 取り込み、`go mod tidy`
+5. **04e — ドキュメント整備とリリース**: 移行ガイド、型マトリクス、`v0.4.0` タグ
 
-```yaml
-- go build ./...
-- go vet ./...
-- make test-unit
-- spin up postgres:17 service container
-  - PG round-trip smoke (1000 行 + 多型テーブル)
-- spin up mysql:8.4 service container
-  - --target=mysql で dump → mysql -e でロード → 件数照合
-```
-
-`replace` 解消後に GitHub に push 可能になるので、その後の作業。
-
-## 課題 6: ドキュメント整備
-
-- `docs/migration-postgres-to-tidb.md`(仮)— ユーザ向け。型マトリクスを公開
-- `docs/limitations.md` — PG 固有機能の制約一覧(PostGIS、hstore、tsvector、
-  パブリケーション、トリガ、ストアドプロシージャ等は dump 対象外)
-- `docs/recipes/` — `pg_dump --schema-only` 出力を TiDB 用に LLM 変換するための
-  プロンプト・テンプレ集
-
-## 着手順序(提案)
-
-1. **04a — Dialect 切り替え骨格**: `--target` フラグ + preamble + 識別子クォート + bytea リテラル切り替え。MySQL ターゲットで小さい round-trip を成立させる
-2. **04b — 型受信器の target 対応**: bool、timestamptz、interval、配列/range の
-   server-side cast 経由出力
-3. **04c — テーブル内 chunk 復活**: 数値 PK 優先 → ctid 補完
-4. **04d — TiDB 依存解消**: `replace` 削除、`internal/` 取り込み
-5. **04e — CI**: PG smoke + TiDB smoke + lint
-6. **04f — ドキュメント整備とリリース**: README に migration ガイド、型マトリクス公開、`v0.4.0` タグ
-
-各段は単独 commit / PR にできる粒度を意図している。
+CI(GitHub Actions)、PostGIS / hstore / tsvector の特殊型対応は Phase 3 へ送る。
 
 ## 非ゴール(Phase 2 ではやらない)
 
-- スキーマ DDL の自動 PG → MySQL/TiDB 変換(LLM 任せの方針)
-- 完全な PG 機能カバレッジ(PostGIS、hstore、tsvector、ユーザ定義型)— 制約として
-  ドキュメント化のみ
+- MySQL 互換 SQL 出力モード(`--target=mysql/tidb` フラグ案は廃案)
+- スキーマ DDL の自動 PG → TiDB 変換(LLM 任せ)
+- 完全な PG 機能カバレッジ(PostGIS、hstore、tsvector、ユーザ定義型 — 制約として
+  ドキュメント化のみ)
 - パブリケーション・トリガ・ストアドプロシージャの dump
-- 双方向同期(あくまでも一方向の dump)
+- 双方向同期(あくまでも一方向)
+- CI / GitHub Actions(Phase 3)
+
+## 関連: 既存の SQL 出力モードの位置づけ
+
+現状の `--filetype sql`(PG-flavored INSERT)は **そのまま残す**:
+
+- 用途は「同じ PG クラスタへの round-trip 検証」「小規模 dev 用」「デバッグ」
+- ローダから `psql -f` で素直に流せるので CSV/Parquet が動かない環境でも使える
+- ただし migration には公式に推奨しない、と README に明記する

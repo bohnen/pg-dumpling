@@ -19,7 +19,7 @@ TiDB のデータ移行ツール**として使えるようにすること。
 | `v0.1.0-baseline` | ✅ | TiDB monorepo から切り出した素の dumpling |
 | `v0.2.0-strip-consistency` | ✅ | consistency lock/flush 削除、テスト一掃 |
 | `v0.3.0-postgres` | ✅ | PG 用 catalog / driver / dialect、bin/pg-dumpling リネーム、Docker round-trip 成功 |
-| Phase 2(進行中) | 🚧 | PG → MySQL/TiDB 移行: 型変換、MySQL ターゲット dialect、テーブル内 chunk、CI |
+| Phase 2(進行中) | 🚧 | **中間フォーマット**経由の PG → TiDB 移行: CSV ハードニング、Parquet 出力、テーブル内 chunk、`replace` 解消 |
 
 ## ビルド & テスト
 
@@ -73,31 +73,28 @@ skip して `SET` だけ流す)。
 - 識別子: `"schema"."table"`、`"col"`(double-quote)
 - 文字列: SQL 標準クォート二重化(`'O''Brien'`)
 - bytea: PG リテラル `'\x48656c6c6f'`
-- 各データファイルの先頭に preamble:
+- 各データファイル(SQL モード)の先頭に preamble:
   ```sql
   SET standard_conforming_strings = on;
   SET client_encoding = 'UTF8';
   SET search_path = pg_catalog;
   ```
-- **重要**: この preamble は MySQL/TiDB では `Unknown system variable` で弾かれる。
-  Phase 2 で `--target {postgres,mysql,tidb}` フラグを足し、ターゲットごとに
-  preamble と識別子クォートを切り替える予定。
+- **重要**: この SQL モード出力は PG 専用(同じ PG クラスタへの round-trip
+  検証用)。MySQL/TiDB に取り込もうとすると `Unknown system variable
+  'standard_conforming_strings'` で弾かれる。
+- Phase 2 では SQL 互換出力は追わず、**CSV / Parquet を中間フォーマット**として
+  整備し、TiDB Lightning 等のローダ経由で TiDB / MySQL へ流す。
 
 ### Postgres と MySQL の型ギャップ
 
-Phase 1 時点では PG → MySQL/TiDB ロードに以下のギャップがある:
+PG → MySQL/TiDB の SQL リテラル互換は範囲が広く、SQL レベルで埋めるのは現実的
+ではない(Phase 1 末の検証で Lightning 系ではなく素の MySQL に流したところ、
+preamble 段階で即時失敗)。
 
-| PG 型 | 出力リテラル | MySQL 取込 |
-|---|---|---|
-| `int2/4/8`、`numeric` | 数値 | OK |
-| `text`、`varchar`、`uuid` | `'...'` | OK(SQL_MODE で `ANSI_QUOTES` 有効化必要) |
-| `bytea` | `'\xHEX'` | **NG**(MySQL は `x'HEX'` か `0xHEX`) |
-| `jsonb` | `'{"a":1}'` | OK(`JSON` カラムへ) |
-| `timestamptz` | `'2026-04-26T21:00:00+09:00'` | **要 cast / 切り捨て**(MySQL は TZ 情報を保持しない) |
-| `date`、`time`、`interval` | 文字列 | 形式調整が必要 |
-| 配列、レンジ、enum | 文字列 | **NG**(MySQL に直接対応なし、JSON 化 or 別表化) |
-
-これら全てが Phase 2 のスコープ。
+Phase 2 の方針: **CSV / Parquet を経由**し、PG 型ごとに `to_jsonb(col)::text` /
+`to_char(col AT TIME ZONE 'UTC', ...)` / `encode(col, 'hex')` 等のサーバ側 cast
+を SELECT 句に仕込んで安全な文字列化を行う。詳細マトリクスは
+`worklog/04-phase2-roadmap.md` 参照。
 
 ## ディレクトリ構成
 
@@ -138,13 +135,17 @@ Phase 1 末で完全削除:
 
 `worklog/04-phase2-roadmap.md` を主参照。要点は:
 
-1. **`--target {postgres,mysql,tidb}` フラグ**で出力 dialect を切り替え
-2. **型変換マトリクス**(`bytea` の `'\xHEX'` ↔ `x'HEX'`、`timestamptz` の TZ 切り捨て、配列の JSON 化、enum の文字列展開、`numeric` の桁適合)
-3. **テーブル内 chunk**(数値 PK レンジ、`ctid` レンジ)
-4. **`pg_dump` 出力の MySQL/TiDB DDL 化レシピ**(LLM 連携を念頭に)
-5. **`replace ~/Work/tidb` の解消**(残った 5 パッケージを `internal/` 取り込み)
-6. **CI**(GitHub Actions: build + PG smoke + MySQL/TiDB smoke)
-7. **PostGIS / hstore / tsvector** 等の特殊型対応
+1. **CSV ハードニング** — PG 固有型(timestamptz / bytea / uuid / json /
+   配列 / range / enum / interval / inet 系)をサーバ側 cast で安全な文字列にして
+   出力。`--csv-binary-format`、bool の 0/1 化等のオプション追加
+2. **Parquet 出力** — `--filetype parquet`。`information_schema.columns` から
+   Parquet schema を導出、`apache/arrow-go` を使ってストリーミング書き出し
+3. **テーブル内 chunk** — 数値 PK レンジ → `ctid` レンジ → partition fan-out
+4. **`replace ~/Work/tidb` の解消** — 残った 5 パッケージを `internal/` 取り込み
+5. **ドキュメント整備と `v0.4.0` リリース**
+
+CI(GitHub Actions)、PostGIS / hstore / tsvector の特殊型対応は Phase 3 へ送る。
+MySQL 互換 SQL 出力モード(`--target=mysql/tidb` フラグ)は **採用しない**。
 
 ## 作業のお作法
 
