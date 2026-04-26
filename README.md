@@ -1,41 +1,129 @@
 pg-dumpling
 ===========
 
-`pg-dumpling` is a fork of [`dumpling`](https://github.com/pingcap/tidb/tree/master/dumpling)
-extracted from the TiDB monorepo, with the long-term goal of supporting
-PostgreSQL as a source database in addition to MySQL/TiDB.
-
-This is the **Phase 0 baseline**: dumpling code physically lifted out of the
-TiDB tree and made buildable as a standalone Go module. No behavior changes
-from upstream yet.
+`pg-dumpling` is a PostgreSQL data dump tool that emits the
+[dumpling](https://github.com/pingcap/tidb/tree/master/dumpling) directory
+format. It is designed as a building block for **PostgreSQL → MySQL / TiDB
+data migration**: data files use SQL standard literals so that, with the
+right preamble and a target schema, the rows can be replayed into a
+MySQL-family database.
 
 Status
 ------
 
-- Module path: `github.com/tadapin/pg-dumpling`
-- Source baseline: snapshot of `~/Work/tidb/dumpling` at TiDB commit
-  `ae18096e02378` (2026-04-26)
-- TiDB-internal dependencies (`github.com/pingcap/tidb/{br,pkg}/...`) are
-  resolved via a local `replace` to `/Users/bohnen/Work/tidb` — this repo
-  cannot build on a machine without that checkout. Phase 1 will start
-  vendoring or replacing those dependencies.
+- **Phase 0** (`v0.1.0-baseline`) — dumpling extracted from the TiDB
+  monorepo as a standalone Go module.
+- **Phase 1** (`v0.3.0-postgres`) — full PostgreSQL source path. The
+  binary connects via `pgx`, queries `pg_catalog`, snapshots via
+  `pg_export_snapshot()`, shells out to `pg_dump --schema-only` for DDL,
+  and writes per-table data files in dumpling's chunked layout.
+- **Phase 2** (in progress) — PG → MySQL/TiDB migration: type
+  adaptation, MySQL-loadable output mode, table-internal chunking, CI.
+  See `worklog/04-phase2-roadmap.md`.
+
+What gets dumped
+----------------
+
+For each PostgreSQL schema selected by `--filter`:
+
+- `<schema>-schema-create.sql` — `CREATE SCHEMA IF NOT EXISTS "schema"`
+- `<schema>.<table>-schema.sql` — verbatim output of
+  `pg_dump --schema-only --no-owner --no-privileges -t schema.table`.
+  The DDL is **PostgreSQL-native**; converting it for a MySQL/TiDB
+  target is left to the user (LLMs are well-suited to this).
+- `<schema>.<table>.<n>.sql` (or `.csv`) — chunked data files. SQL files
+  contain `INSERT INTO "schema"."table" VALUES (...)` statements with
+  PG-standard escaping; the file is preceded by a `SET
+  standard_conforming_strings = on; SET client_encoding = 'UTF8'; SET
+  search_path = pg_catalog;` preamble.
+- `metadata` — currently a no-op for PostgreSQL (Phase 2 will add
+  `pg_current_wal_lsn()`).
+
+The orchestration is identical to upstream dumpling: `--threads` worker
+pool, file-size rolling, optional `gzip`/`snappy`/`zstd` compression,
+external storage targets (S3/GCS/Azure), Prometheus metrics, an HTTP
+status endpoint.
 
 Prerequisites
 -------------
 
-- Go 1.25.8 or newer (the build will auto-fetch the toolchain via
+- **Go 1.25.8 or newer** (the build will auto-fetch the toolchain via
   `GOTOOLCHAIN=auto` if your installed `go` is older).
-- A local TiDB checkout at `/Users/bohnen/Work/tidb`. If yours is elsewhere,
-  edit the `replace` directive in `go.mod`.
+- **`pg_dump`** on `$PATH` of the machine running pg-dumpling. Schema
+  files are produced by spawning `pg_dump --schema-only` against the
+  source. The bundled child uses the same connection parameters as the
+  data path. A version of `pg_dump` that matches or exceeds the source
+  server is recommended.
+- A local TiDB checkout at `/Users/bohnen/Work/tidb` is still required
+  for module resolution (the few remaining `br/pkg/...` and
+  `pkg/util/...` imports). Phase 2 will vendor or rewrite those so the
+  `replace` directive can be removed.
 
 Building
 --------
 
 ```sh
 make build
-./bin/dumpling --version
-./bin/dumpling --help
+./bin/pg-dumpling --help
 ```
+
+Quick start
+-----------
+
+```sh
+docker run --rm -d --name pg -e POSTGRES_PASSWORD=secret -p 5433:5432 postgres:17
+psql -h 127.0.0.1 -p 5433 -U postgres -c "CREATE DATABASE demo"
+psql -h 127.0.0.1 -p 5433 -U postgres -d demo -c \
+  "CREATE TABLE t(id int primary key, s text);
+   INSERT INTO t SELECT g, 'row '||g FROM generate_series(1,1000) g"
+
+./bin/pg-dumpling \
+    -h 127.0.0.1 -P 5433 -u postgres -p secret \
+    -B demo -o /tmp/dump --threads 4 --consistency snapshot
+
+ls /tmp/dump
+# metadata
+# public-schema-create.sql
+# public.t-schema.sql
+# public.t.000000000.sql
+```
+
+Reload into a fresh PostgreSQL:
+
+```sh
+psql -h 127.0.0.1 -p 5433 -U postgres -c "CREATE DATABASE demo2"
+psql ... -d demo2 -f /tmp/dump/public.t-schema.sql
+psql ... -d demo2 -f /tmp/dump/public.t.000000000.sql
+```
+
+Loading into MySQL/TiDB requires a manual schema translation step (the
+`-schema.sql` is PG-native) and a Phase 2 dialect flag for the data
+files. See `worklog/04-phase2-roadmap.md`.
+
+Flag highlights
+---------------
+
+```
+-h --host           PostgreSQL host (default 127.0.0.1)
+-P --port           PostgreSQL port (default 5432)
+-u --user           PostgreSQL user (default postgres)
+-p --password       password
+-B --database       database name (PGDATABASE for the connection)
+-o --output         output directory
+-t --threads        worker count
+   --filetype       sql | csv
+   --consistency    auto | snapshot | none
+   --snapshot       reuse a pg_export_snapshot() token
+-f --filter         table filter glob, e.g. "public.*" or "!pg_catalog.*"
+   --no-schemas     skip emitting -schema.sql files
+   --no-data        emit only schema files
+   --no-views       skip views (default true)
+   --compress       gzip | snappy | zstd | no-compression
+   --rows           split tables into N-row chunks (Phase 2; currently no-op)
+```
+
+`--allow-cleartext-passwords`, `--tidb-mem-quota-query`, and the
+charset/collation flags from upstream dumpling are removed.
 
 Tests
 -----
@@ -45,28 +133,21 @@ make test-unit              # short unit tests, no failpoint rewrite
 make test-unit-failpoint    # full unit tests after rewriting failpoints
 ```
 
-A few tests in `export/` (`TestWriteTableMeta`, `TestWriteTableData`)
-intentionally rely on `failpoint`-injected error paths and only pass when the
-sources have been rewritten by `failpoint-ctl`. Install it once with:
-
-```sh
-go install github.com/pingcap/failpoint/failpoint-ctl@latest
-```
-
-The integration suite under `tests/` is shell-driven and requires TiDB,
-MinIO, and other services. It is not wired into the Makefile in this baseline.
+Most upstream MySQL-specific tests were dropped in Phase 1; PG-specific
+unit tests are pending and will be added in Phase 2 alongside the
+TiDB-target work.
 
 Layout
 ------
 
 ```
 cli/             version metadata
-cmd/dumpling/    CLI entry point (main package)
-context/         logger-aware context wrapper
-export/          dump engine (config, dump loop, sql gen, writer, ir, ...)
-log/             zap-based logging facade
-tests/           upstream integration tests (not yet runnable here)
-docs/            upstream user docs (en/cn)
+cmd/pg-dumpling/ CLI entry point
+context/         logger-aware context
+export/          dump engine
+log/             zap wrapper
+worklog/         per-step engineering notes (00 baseline, 01 plan,
+                 02 strip, 03 pg-source, 04 phase 2 roadmap)
 ```
 
 License

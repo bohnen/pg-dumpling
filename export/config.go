@@ -24,7 +24,6 @@ import (
 	filter "github.com/pingcap/tidb/pkg/util/table-filter"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/spf13/pflag"
-	"go.uber.org/atomic"
 	"go.uber.org/zap"
 )
 
@@ -35,7 +34,6 @@ const (
 	flagUser                     = "user"
 	flagPort                     = "port"
 	flagPassword                 = "password"
-	flagAllowCleartextPasswords  = "allow-cleartext-passwords"
 	flagThreads                  = "threads"
 	flagFilesize                 = "filesize"
 	flagStatementSize            = "statement-size"
@@ -61,7 +59,6 @@ const (
 	flagFilter                   = "filter"
 	flagCaseSensitive            = "case-sensitive"
 	flagDumpEmptyDatabase        = "dump-empty-database"
-	flagTidbMemQuotaQuery        = "tidb-mem-quota-query"
 	flagCA                       = "ca"
 	flagCert                     = "cert"
 	flagKey                      = "key"
@@ -115,12 +112,11 @@ var DialectBinaryFormatMap = map[CSVDialect]BinaryFormat{
 	CSVDialectBigQuery:  BinaryFormatBase64,
 }
 
-// Config is the dump config for dumpling
+// Config is the dump config for pg-dumpling.
 type Config struct {
 	storage.BackendOptions
 
 	SpecifiedTables          bool
-	AllowCleartextPasswords  bool
 	SortByPk                 bool
 	NoViews                  bool
 	NoSequences              bool
@@ -164,30 +160,25 @@ type Config struct {
 	CsvLineTerminator string
 	Databases         []string
 
-	TableFilter         filter.Filter `json:"-"`
-	Where               string
-	FileType            string
-	ServerInfo          version.ServerInfo
-	Logger              *zap.Logger        `json:"-"`
-	OutputFileTemplate  *template.Template `json:"-"`
-	Rows                uint64
-	ReadTimeout         time.Duration
-	TiDBMemQuotaQuery   uint64
-	FileSize            uint64
-	StatementSize       uint64
-	SessionParams       map[string]any
-	Tables              DatabaseTables
-	CollationCompatible string
-	CsvOutputDialect    CSVDialect
+	TableFilter        filter.Filter `json:"-"`
+	Where              string
+	FileType           string
+	ServerInfo         version.ServerInfo
+	Logger             *zap.Logger        `json:"-"`
+	OutputFileTemplate *template.Template `json:"-"`
+	Rows               uint64
+	ReadTimeout        time.Duration
+	FileSize           uint64
+	StatementSize      uint64
+	SessionParams      map[string]any
+	Tables             DatabaseTables
+	CsvOutputDialect   CSVDialect
 
 	Labels        prometheus.Labels       `json:"-"`
 	PromFactory   promutil.Factory        `json:"-"`
 	PromRegistry  promutil.Registry       `json:"-"`
 	ExtStorage    storage.ExternalStorage `json:"-"`
 	MinTLSVersion uint16                  `json:"-"`
-
-	IOTotalBytes *atomic.Uint64
-	Net          string
 }
 
 // ServerInfoUnknown is the unknown database type to dumpling
@@ -202,8 +193,8 @@ func DefaultConfig() *Config {
 	return &Config{
 		Databases:                nil,
 		Host:                     "127.0.0.1",
-		User:                     "root",
-		Port:                     3306,
+		User:                     "postgres",
+		Port:                     5432,
 		Password:                 "",
 		Threads:                  4,
 		Logger:                   nil,
@@ -235,7 +226,6 @@ func DefaultConfig() *Config {
 		SessionParams:            make(map[string]any),
 		OutputFileTemplate:       DefaultOutputFileTemplate,
 		PosAfterConnect:          false,
-		CollationCompatible:      LooseCollationCompatible,
 		CsvOutputDialect:         CSVDialectDefault,
 		SpecifiedTables:          false,
 		PromFactory:              promutil.NewDefaultFactory(),
@@ -330,10 +320,9 @@ func (*Config) DefineFlags(flags *pflag.FlagSet) {
 	flags.StringSliceP(flagDatabase, "B", nil, "Databases to dump")
 	flags.StringSliceP(flagTablesList, "T", nil, "Comma delimited table list to dump; must be qualified table names")
 	flags.StringP(flagHost, "h", "127.0.0.1", "The host to connect to")
-	flags.StringP(flagUser, "u", "root", "Username with privileges to run the dump")
+	flags.StringP(flagUser, "u", "postgres", "Username with privileges to run the dump")
 	flags.IntP(flagPort, "P", 5432, "TCP/IP port to connect to")
 	flags.StringP(flagPassword, "p", "", "User password")
-	flags.Bool(flagAllowCleartextPasswords, false, "Allow passwords to be sent in cleartext (warning: don't use without TLS)")
 	flags.IntP(flagThreads, "t", 4, "Number of goroutines to use, default 4")
 	flags.StringP(flagFilesize, "F", "", "The approximate size of output file")
 	flags.Uint64P(flagStatementSize, "s", DefaultStatementSize, "Attempted size of INSERT statement in bytes")
@@ -341,14 +330,13 @@ func (*Config) DefineFlags(flags *pflag.FlagSet) {
 	flags.String(flagLoglevel, "info", "Log level: {debug|info|warn|error|dpanic|panic|fatal}")
 	flags.StringP(flagLogfile, "L", "", "Log file `path`, leave empty to write to console")
 	flags.String(flagLogfmt, "text", "Log `format`: {text|json}")
-	flags.String(flagConsistency, ConsistencyTypeAuto, "Consistency level during dumping: {auto|none|flush|lock|snapshot}")
-	flags.String(flagSnapshot, "", "Snapshot position (uint64 or MySQL style string timestamp). Valid only when consistency=snapshot")
+	flags.String(flagConsistency, ConsistencyTypeAuto, "Consistency level during dumping: {auto|snapshot|none}. auto resolves to snapshot for PostgreSQL")
+	flags.String(flagSnapshot, "", "Snapshot token from pg_export_snapshot(). Valid only when consistency=snapshot. Empty means export a fresh one")
 	flags.BoolP(flagNoViews, "W", true, "Do not dump views")
 	flags.Bool(flagNoSequences, true, "Do not dump sequences")
 	flags.Bool(flagSortByPk, true, "Sort dump results by primary key through order by sql")
 	flags.String(flagStatusAddr, ":8281", "dumpling API server and pprof addr")
-	flags.Uint64P(flagRows, "r", UnspecifiedSize, "If specified, dumpling will split table into chunks and concurrently dump them to different files to improve efficiency. For TiDB v3.0+, specify this will make dumpling split table with each file one TiDB region(no matter how many rows is).\n"+
-		"If not specified, dumpling will dump table without inner-concurrency which could be relatively slow. default unlimited")
+	flags.Uint64P(flagRows, "r", UnspecifiedSize, "If specified, pg-dumpling will split tables into chunks of this many rows for parallel dumping. Phase 2 feature; currently a no-op (each table is dumped sequentially within its --threads slot).")
 	flags.String(flagWhere, "", "Dump only selected records")
 	flags.Bool(flagEscapeBackslash, true, "use backslash to escape special characters")
 	flags.String(flagFiletype, "", "The type of export file (sql/csv)")
@@ -361,7 +349,6 @@ func (*Config) DefineFlags(flags *pflag.FlagSet) {
 	flags.StringSliceP(flagFilter, "f", []string{"*.*", DefaultTableFilter}, "filter to select which tables to dump")
 	flags.Bool(flagCaseSensitive, false, "whether the filter should be case-sensitive")
 	flags.Bool(flagDumpEmptyDatabase, true, "whether to dump empty database")
-	flags.Uint64(flagTidbMemQuotaQuery, UnspecifiedSize, "The maximum memory limit for a single SQL statement, in bytes.")
 	flags.String(flagCA, "", "The path name to the certificate authority file for TLS connection")
 	flags.String(flagCert, "", "The path name to the client certificate file for TLS connection")
 	flags.String(flagKey, "", "The path name to the client private key file for TLS connection")
@@ -401,10 +388,6 @@ func (conf *Config) ParseFromFlags(flags *pflag.FlagSet) error {
 		return errors.Trace(err)
 	}
 	conf.Password, err = flags.GetString(flagPassword)
-	if err != nil {
-		return errors.Trace(err)
-	}
-	conf.AllowCleartextPasswords, err = flags.GetBool(flagAllowCleartextPasswords)
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -529,10 +512,6 @@ func (conf *Config) ParseFromFlags(flags *pflag.FlagSet) error {
 		return errors.Trace(err)
 	}
 	conf.TransactionalConsistency, err = flags.GetBool(flagTransactionalConsistency)
-	if err != nil {
-		return errors.Trace(err)
-	}
-	conf.TiDBMemQuotaQuery, err = flags.GetUint64(flagTidbMemQuotaQuery)
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -741,28 +720,10 @@ const (
 	UnspecifiedSize = 0
 	// DefaultStatementSize is the default statement size
 	DefaultStatementSize = 1000000
-	// TiDBMemQuotaQueryName is the session variable TiDBMemQuotaQuery's name in TiDB
-	TiDBMemQuotaQueryName = "tidb_mem_quota_query"
-	// DefaultTableFilter is the default exclude table filter. It will exclude all system databases
-	DefaultTableFilter = "!/^(mysql|sys|INFORMATION_SCHEMA|PERFORMANCE_SCHEMA|METRICS_SCHEMA|INSPECTION_SCHEMA)$/.*"
+	// DefaultTableFilter excludes PostgreSQL system schemas.
+	DefaultTableFilter = "!/^(pg_catalog|information_schema|pg_toast)$/.*"
 
 	defaultTaskChannelCapacity = 128
-	defaultDumpGCSafePointTTL  = 5 * 60
-	defaultEtcdDialTimeOut     = 3 * time.Second
-
-	// LooseCollationCompatible is used in DM, represents a collation setting for best compatibility.
-	LooseCollationCompatible = "loose"
-	// StrictCollationCompatible is used in DM, represents a collation setting for correctness.
-	StrictCollationCompatible = "strict"
-
-	dumplingServiceSafePointPrefix = "dumpling"
-)
-
-var (
-	decodeRegionVersion    = semver.New("3.0.0")
-	gcSafePointVersion     = semver.New("4.0.0")
-	tableSampleVersion     = semver.New("5.0.0-nightly")
-	minNewTerminologyMySQL = semver.New("8.4.0") // first MySQL version to no longer support MASTER/SLAVE/etc
 )
 
 func adjustConfig(conf *Config, fns ...func(*Config) error) error {

@@ -11,7 +11,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/google/uuid"
 	// register pgx as the database/sql driver
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/pingcap/errors"
@@ -22,7 +21,6 @@ import (
 	"github.com/tadapin/pg-dumpling/cli"
 	tcontext "github.com/tadapin/pg-dumpling/context"
 	"github.com/tadapin/pg-dumpling/log"
-	gatomic "go.uber.org/atomic"
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
 )
@@ -84,16 +82,6 @@ func NewDumper(ctx context.Context, conf *Config) (*Dumper, error) {
 	if err != nil {
 		return nil, err
 	}
-	failpoint.Inject("SetIOTotalBytes", func(_ failpoint.Value) {
-		d.conf.IOTotalBytes = gatomic.NewUint64(0)
-		d.conf.Net = uuid.New().String()
-		go func() {
-			for {
-				time.Sleep(10 * time.Millisecond)
-				d.tctx.L().Logger.Info("IOTotalBytes", zap.Uint64("IOTotalBytes", d.conf.IOTotalBytes.Load()))
-			}
-		}()
-	})
 
 	err = runSteps(d,
 		initLogger,
