@@ -28,6 +28,7 @@ type TableMeta interface {
 	ColumnTypes() []string
 	ColumnNames() []string
 	SelectedField() string
+	SelectColumns() string
 	SelectedLen() int
 	SpecialComments() StringIter
 	ShowCreateTable() string
@@ -85,7 +86,7 @@ type MetaIR interface {
 	MetaSQL() string
 }
 
-func setTableMetaFromRows(rows *sql.Rows) (TableMeta, error) {
+func setTableMetaFromRows(rows *sql.Rows, dialect SQLDialect) (TableMeta, error) {
 	tps, err := rows.ColumnTypes()
 	if err != nil {
 		return nil, errors.Trace(err)
@@ -94,13 +95,17 @@ func setTableMetaFromRows(rows *sql.Rows) (TableMeta, error) {
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
-	for i := range nms {
-		nms[i] = pgQuoteIdent(nms[i])
+	exprs := make([]string, len(nms))
+	cols := make([]string, len(nms))
+	for i, n := range nms {
+		exprs[i] = pgQuoteIdent(n)
+		cols[i] = dialect.QuoteIdent(n)
 	}
 	return &tableMeta{
 		colTypes:      tps,
-		selectedField: strings.Join(nms, ","),
+		selectedField: strings.Join(exprs, ","),
+		selectColumns: strings.Join(cols, ","),
 		selectedLen:   len(nms),
-		specCmts:      getSpecialComments(),
+		specCmts:      dialect.Preamble(),
 	}, nil
 }

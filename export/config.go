@@ -70,6 +70,7 @@ const (
 	flagTransactionalConsistency = "transactional-consistency"
 	flagCompress                 = "compress"
 	flagCsvOutputDialect         = "csv-output-dialect"
+	flagTarget                   = "target"
 
 	// FlagHelp represents the help flag
 	FlagHelp = "help"
@@ -170,6 +171,7 @@ type Config struct {
 	SessionParams      map[string]any
 	Tables             DatabaseTables
 	CsvOutputDialect   CSVDialect
+	Target             SQLTarget
 
 	Labels        prometheus.Labels       `json:"-"`
 	PromRegistry  prometheus.Registerer   `json:"-"`
@@ -216,6 +218,7 @@ func DefaultConfig() *Config {
 		OutputFileTemplate:       DefaultOutputFileTemplate,
 		PosAfterConnect:          false,
 		CsvOutputDialect:         CSVDialectDefault,
+		Target:                   TargetMySQL,
 		SpecifiedTables:          false,
 		PromRegistry:             prometheus.NewRegistry(),
 		TransactionalConsistency: true,
@@ -353,6 +356,7 @@ func (*Config) DefineFlags(flags *pflag.FlagSet) {
 	_ = flags.MarkHidden(flagTransactionalConsistency)
 	flags.StringP(flagCompress, "c", "", "Compress output file type, support 'gzip', 'snappy', 'zstd', 'no-compression' now")
 	flags.String(flagCsvOutputDialect, "", "The dialect of output CSV file, support 'snowflake', 'redshift', 'bigquery' now")
+	flags.String(flagTarget, "mysql", "The target SQL dialect for --filetype=sql: 'mysql' (default) / 'tidb' / 'pg' (round-trip to Postgres)")
 }
 
 // ParseFromFlags parses dumpling's export.Config from flags
@@ -586,6 +590,15 @@ func (conf *Config) ParseFromFlags(flags *pflag.FlagSet) error {
 		return errors.Errorf("%s is only supported when dumping whole table to csv, not compatible with %s", flagCsvOutputDialect, conf.FileType)
 	}
 	conf.CsvOutputDialect, err = ParseOutputDialect(dialect)
+	if err != nil {
+		return errors.Trace(err)
+	}
+
+	target, err := flags.GetString(flagTarget)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	conf.Target, err = ParseSQLTarget(target)
 	if err != nil {
 		return errors.Trace(err)
 	}

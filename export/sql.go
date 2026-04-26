@@ -118,12 +118,12 @@ func ShowTables(db *sql.Conn) ([]string, error) {
 	return res.data, nil
 }
 
-// ShowCreateDatabase emits a CREATE SCHEMA statement for the given schema.
-// In Postgres there's no "SHOW CREATE DATABASE" equivalent that produces the
-// owner/encoding hints; we just emit a permissive CREATE SCHEMA so the dump
-// can be loaded into a fresh database.
-func ShowCreateDatabase(_ *tcontext.Context, _ *BaseConn, database string) (string, error) {
-	return fmt.Sprintf(`CREATE SCHEMA IF NOT EXISTS %s`, pgQuoteIdent(database)), nil
+// ShowCreateDatabase emits the dialect-appropriate CREATE statement
+// (CREATE SCHEMA for pg, CREATE DATABASE for mysql/tidb) so the dump can
+// be loaded into a fresh database. There's no PG "SHOW CREATE DATABASE"
+// equivalent producing owner/encoding hints; we emit a permissive form.
+func ShowCreateDatabase(_ *tcontext.Context, _ *BaseConn, database string, dialect SQLDialect) (string, error) {
+	return dialect.CreateDatabaseStmt(database), nil
 }
 
 // ShowCreateTable shells out to pg_dump --schema-only to get the DDL for a
@@ -633,9 +633,15 @@ func SetPgSnapshotToken(token string) { pgSnapshotToken = token }
 // the udt_name and disambiguates data_type='USER-DEFINED' (enum, pgvector,
 // hstore, ranges).
 //
+// csvMode controls bytea handling:
+//   - true  (CSV output): bytea is encoded to a hex string via encode(b,'hex')
+//     so it survives ASCII-only CSV cells. The loader is expected to UNHEX it.
+//   - false (SQL output to MySQL/TiDB): bytea is left as raw bytes; the
+//     SQLTypeBytes receiver renders X'...' literals via the dialect.
+//
 // For types that don't need rewriting (integer, numeric, text, varchar, ...)
 // the bare quoted reference is returned unchanged.
-func pgMigrationCast(colName, dataType, udtName string) string {
+func pgMigrationCast(colName, dataType, udtName string, csvMode bool) string {
 	q := pgQuoteIdent(colName)
 	alias := " AS " + q
 	switch dataType {
@@ -659,7 +665,12 @@ func pgMigrationCast(colName, dataType, udtName string) string {
 	case "boolean":
 		return "(" + q + ")::int" + alias
 	case "bytea":
-		return "encode(" + q + ", 'hex')" + alias
+		if csvMode {
+			return "encode(" + q + ", 'hex')" + alias
+		}
+		// SQL mode: keep the raw bytea so SQLTypeBytes can write a
+		// dialect-specific binary literal (X'...' on MySQL/TiDB).
+		return q
 	case "uuid", "json", "jsonb", "inet", "cidr", "macaddr", "macaddr8",
 		"xml", "money":
 		return "(" + q + ")::text" + alias
@@ -682,16 +693,24 @@ func pgMigrationCast(colName, dataType, udtName string) string {
 	return q
 }
 
-// buildSelectField returns the selecting fields' string (comma-joined) and
-// the number of writable columns. Reads from information_schema.columns and
-// drops STORED/ALWAYS GENERATED columns from the projection so the dumped
-// INSERT statements remain valid on reload.
+// buildSelectField returns:
+//   - selectExpr: the comma-joined SELECT projection sent to PostgreSQL.
+//     When useCasts is true, each non-trivial column is wrapped via
+//     pgMigrationCast so the values arrive at the writer in a
+//     MySQL/TiDB-friendly text form. PG identifier quoting is used here
+//     since the expression is consumed by the source server.
+//   - selectColumns: the dialect-quoted, comma-joined list of writable
+//     column names suitable for "INSERT INTO t (cols) VALUES" output. Empty
+//     when not needed (no completeInsert, no generated columns, no casts —
+//     in which case the SELECT shortcut '*' is used).
+//   - count: the number of writable columns.
 //
-// When migrationCasts is true (CSV mode for PG → MySQL/TiDB migration) each
-// non-trivial column is wrapped via pgMigrationCast so the values arrive at
-// the writer in a form MySQL/TiDB can ingest. In SQL mode the cast is skipped
-// to keep PG → PG round-trip lossless.
-func buildSelectField(tctx *tcontext.Context, db *BaseConn, dbName, tableName string, completeInsert, migrationCasts bool) (string, int, error) {
+// Reads from information_schema.columns and drops STORED/ALWAYS GENERATED
+// columns so the dumped INSERT statements remain valid on reload.
+//
+// csvMode controls bytea cast behavior; see pgMigrationCast. When useCasts
+// is false, csvMode is ignored.
+func buildSelectField(tctx *tcontext.Context, db *BaseConn, dbName, tableName string, completeInsert, useCasts, csvMode bool, dialect SQLDialect) (string, string, int, error) {
 	const q = `
 SELECT column_name, is_generated, data_type, udt_name
 FROM information_schema.columns
@@ -701,9 +720,10 @@ ORDER BY ordinal_position`
 		[]string{"column_name", "is_generated", "data_type", "udt_name"},
 		q, dbName, tableName)
 	if err != nil {
-		return "", 0, err
+		return "", "", 0, err
 	}
-	availableFields := make([]string, 0, len(results))
+	exprs := make([]string, 0, len(results))
+	cols := make([]string, 0, len(results))
 	hasGenerateColumn := false
 	for _, oneRow := range results {
 		fieldName, isGen, dataType, udtName := oneRow[0], oneRow[1], oneRow[2], oneRow[3]
@@ -711,20 +731,20 @@ ORDER BY ordinal_position`
 			hasGenerateColumn = true
 			continue
 		}
-		var expr string
-		if migrationCasts {
-			expr = pgMigrationCast(fieldName, dataType, udtName)
+		if useCasts {
+			exprs = append(exprs, pgMigrationCast(fieldName, dataType, udtName, csvMode))
 		} else {
-			expr = pgQuoteIdent(fieldName)
+			exprs = append(exprs, pgQuoteIdent(fieldName))
 		}
-		availableFields = append(availableFields, expr)
+		cols = append(cols, dialect.QuoteIdent(fieldName))
 	}
 	// Migration casts rename column expressions, so we have to spell them
-	// out in the SELECT (no '*' shortcut).
-	if completeInsert || hasGenerateColumn || migrationCasts {
-		return strings.Join(availableFields, ","), len(availableFields), nil
+	// out in the SELECT (no '*' shortcut). Same when --complete-insert was
+	// requested or generated columns were filtered out.
+	if completeInsert || hasGenerateColumn || useCasts {
+		return strings.Join(exprs, ","), strings.Join(cols, ","), len(exprs), nil
 	}
-	return "*", len(availableFields), nil
+	return "*", "", len(exprs), nil
 }
 
 func buildWhereClauses(handleColNames []string, handleVals [][]string) []string {

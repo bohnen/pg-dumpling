@@ -23,9 +23,21 @@ Status
   Lightning / `LOAD DATA LOCAL INFILE` can ingest. Table-internal
   chunking restored (numeric PK range + ctid fallback). TiDB-internal
   imports trimmed from 7 to 1; only `br/pkg/storage` (cloud backend
-  layer) still requires the local TiDB checkout via the go.mod
-  `replace`. Verified end-to-end against `postgres:17` ↔
-  `tidb:v8.5.6` and `mysql:8.4`. See `worklog/04-phase2-roadmap.md`.
+  layer) is still pulled from `pingcap/tidb`. Verified end-to-end
+  against `postgres:17` ↔ `tidb:v8.5.6` and `mysql:8.4`. See
+  `worklog/04-phase2-roadmap.md`.
+- **Phase 3a** (`v0.5.0`) — `replace ~/Work/tidb` removed. The remaining
+  `br/pkg/storage` import is now sourced from a public commit pin
+  (`v1.1.0-beta.0.20260413061245-ae18096e0237` = TiDB v8.5.6) via
+  `proxy.golang.org`; no local TiDB checkout is required to build.
+  See `worklog/05-phase3a-public-commit-pin.md`.
+- **Phase 3** (`v0.6.0`) — SQL output is now MySQL/TiDB-targeted by
+  default. A new `--target {mysql,tidb,pg}` flag selects the SQL flavor
+  (backtick identifiers, MySQL preamble, `X'…'` bytea, server-side
+  casts). With the default `--target=mysql`, dump files can be loaded
+  directly via `mysql -h … < dump.sql` against MySQL 8.4 / TiDB v8.5.6.
+  Use `--target=pg` for the legacy PG round-trip behavior. See
+  `worklog/06-phase3-mysql-sql.md`.
 
 What gets dumped
 ----------------
@@ -60,10 +72,11 @@ Prerequisites
   source. The bundled child uses the same connection parameters as the
   data path. A version of `pg_dump` that matches or exceeds the source
   server is recommended.
-- A local TiDB checkout at `/Users/bohnen/Work/tidb` is still required
-  for module resolution (the few remaining `br/pkg/...` and
-  `pkg/util/...` imports). Phase 2 will vendor or rewrite those so the
-  `replace` directive can be removed.
+- No local TiDB checkout is required since v0.5.0. The remaining
+  `github.com/pingcap/tidb/br/pkg/storage` import is pinned to a public
+  pseudo-version of v8.5.6 in `go.mod` and resolved via
+  `proxy.golang.org`. To bump it, run `go get
+  github.com/pingcap/tidb@<commit-or-tag>` followed by `go mod tidy`.
 
 Building
 --------
@@ -102,18 +115,22 @@ psql ... -d demo2 -f /tmp/dump/public.t-schema.sql
 psql ... -d demo2 -f /tmp/dump/public.t.000000000.sql
 ```
 
-Loading into MySQL/TiDB is **not** a direct `psql -f` operation — the
-data files use PG-flavored literals and the schema is PG-native. The
-Phase 2 plan is:
+Loading into MySQL/TiDB (the default target since v0.6.0):
 
-1. Translate the `-schema.sql` files (PG DDL) into MySQL/TiDB DDL
-   yourself or via an LLM, then run them on the target.
-2. Re-run pg-dumpling with `--filetype csv` (Phase 2 hardens this for
-   PG-specific types via server-side casts) and feed the resulting
-   files to TiDB Lightning.
+```sh
+# 1. Translate the PG DDL into MySQL/TiDB DDL (LLM-assisted is fine).
+mysql -h <target> -e "CREATE DATABASE demo"
+mysql -h <target> demo < hand_translated_schema.sql
 
-See `worklog/04-phase2-roadmap.md` for the type-cast matrix and the
-implementation roadmap.
+# 2. The data files default to --target=mysql output.
+./bin/pg-dumpling -h pg -B demo -o /tmp/dump --filetype sql
+mysql -h <target> < /tmp/dump/public.t.000000000.sql
+```
+
+For larger datasets `--filetype csv` is also fully MySQL/TiDB-compatible
+and ingests well via TiDB Lightning or `LOAD DATA LOCAL INFILE`. See
+`worklog/04-phase2-roadmap.md` for the type-cast matrix and
+`worklog/06-phase3-mysql-sql.md` for the SQL-target details.
 
 Flag highlights
 ---------------
@@ -127,6 +144,7 @@ Flag highlights
 -o --output         output directory
 -t --threads        worker count
    --filetype       sql | csv
+   --target         mysql | tidb | pg   (SQL-output dialect, default mysql)
    --consistency    auto | snapshot | none
    --snapshot       reuse a pg_export_snapshot() token
 -f --filter         table filter glob, e.g. "public.*" or "!pg_catalog.*"

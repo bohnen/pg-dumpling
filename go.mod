@@ -8,7 +8,7 @@ require (
 	github.com/pingcap/errors v0.11.5-0.20250523034308-74f78ae071ee
 	github.com/pingcap/failpoint v0.0.0-20240528011301-b51a646c7c86
 	github.com/pingcap/log v1.1.1-0.20250917021125-19901e015dc9
-	github.com/pingcap/tidb v0.0.0-00010101000000-000000000000
+	github.com/pingcap/tidb v1.1.0-beta.0.20260413061245-ae18096e0237
 	github.com/prometheus/client_golang v1.23.0
 	github.com/prometheus/client_model v0.6.2
 	github.com/soheilhy/cmux v0.1.5
@@ -108,7 +108,7 @@ require (
 	github.com/petermattis/goid v0.0.0-20250813065127-a731cc31b4fe // indirect
 	github.com/pingcap/kvproto v0.0.0-20260302041553-bdcab1db9bef // indirect
 	github.com/pingcap/sysutil v1.0.1-0.20240311050922-ae81ee01f3a5 // indirect
-	github.com/pingcap/tidb/pkg/parser v0.0.0-20211011031125-9b13dc409c5e // indirect
+	github.com/pingcap/tidb/pkg/parser v0.0.0-20260331085336-4e0b702f38a8 // indirect
 	github.com/pingcap/tipb v0.0.0-20260202031324-4ce7b6c65c98 // indirect
 	github.com/pkg/browser v0.0.0-20240102092130-5ac0b6a4141c // indirect
 	github.com/pkg/errors v0.9.1 // indirect
@@ -161,14 +161,13 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
 
-// Mirror the replaces from /Users/bohnen/Work/tidb/go.mod.
+// Mirror the replaces from upstream tidb/go.mod.
 // Replace directives in upstream modules are NOT inherited by downstream
 // consumers, so we must repeat them here for the build to resolve.
+// github.com/pingcap/tidb itself is now pinned to a public commit (v8.5.6).
 replace (
 	github.com/apache/arrow-go/v18 => github.com/joechenrh/arrow-go/v18 v18.0.0-20250911101656-62c34c9a3b82
 	github.com/go-ldap/ldap/v3 => github.com/YangKeao/ldap/v3 v3.4.5-0.20230421065457-369a3bab1117
-	github.com/pingcap/tidb => /Users/bohnen/Work/tidb
-	github.com/pingcap/tidb/pkg/parser => /Users/bohnen/Work/tidb/pkg/parser
 	sourcegraph.com/sourcegraph/appdash => github.com/sourcegraph/appdash v0.0.0-20190731080439-ebfcffb1b5c0
 	sourcegraph.com/sourcegraph/appdash-data => github.com/sourcegraph/appdash-data v0.0.0-20151005221446-73f23eafcf67
 )

@@ -20,6 +20,8 @@ TiDB のデータ移行ツール**として使えるようにすること。
 | `v0.2.0-strip-consistency` | ✅ | consistency lock/flush 削除、テスト一掃 |
 | `v0.3.0-postgres` | ✅ | PG 用 catalog / driver / dialect、bin/pg-dumpling リネーム、Docker round-trip 成功 |
 | `v0.4.0` | ✅ | Phase 2 完了: CSV server-side cast 21 型、テーブル内 chunk(数値 PK + ctid)、TiDB 内部依存 7→1、TiDB v8.5.6 への CSV 移行検証成功 |
+| `v0.5.0` | ✅ | Phase 3a: `replace ~/Work/tidb` 撤去。`github.com/pingcap/tidb` を public commit pin(`v1.1.0-beta.0.20260413061245-ae18096e0237` = v8.5.6)に切替 |
+| `v0.6.0` | ✅ | Phase 3: SQL 出力を MySQL/TiDB 向けに修正。`--target {mysql,tidb,pg}` を追加、デフォルト `mysql`。MySQL/TiDB 直叩きルート(`mysql -h … < dump.sql`)が確立 |
 
 ## ビルド & テスト
 
@@ -36,17 +38,25 @@ make clean                  # bin/ 削除
 
 ## 重要な制約
 
-### TiDB ローカルチェックアウトに依然として依存
+### TiDB 依存は public commit pin に解決済み(v0.5.0)
 
-`go.mod` の `replace github.com/pingcap/tidb => /Users/bohnen/Work/tidb` を消すと
-build できない。残っている TiDB パッケージは:
+`go.mod` は `github.com/pingcap/tidb v1.1.0-beta.0.20260413061245-ae18096e0237`
+(= v8.5.6 commit `ae18096e0237`)に固定。**ローカルチェックアウトは不要**で、
+`go build` は `proxy.golang.org` から透明に解決する。
 
-- `br/pkg/storage`(S3/GCS/Azure 抽象)
-- `br/pkg/utils`(retry helper)
-- `br/pkg/summary`(進捗サマリ)
-- `pkg/util/{table-filter, promutil}`、`pkg/util`(SliceKeysQuoted 等の数行)
+実際に import している TiDB 内部パッケージは `br/pkg/storage` 1 個だけ
+(S3/GCS/Azure/ローカルの統一抽象)。これはクラウドバックエンド対応の
+中核なので意図的に残している。
 
-Phase 2 でこれらを `internal/` に取り込む方針。
+依存を更新したくなったら:
+
+```sh
+go get github.com/pingcap/tidb@<commit-or-tag>
+go mod tidy
+```
+
+`replace` ディレクティブには TiDB 上流 go.mod から継承した非 TiDB 系のもの
+(`apache/arrow-go`、`go-ldap`、`sourcegraph` 系)だけが残っている。
 
 ### `pg_dump` を child process として呼ぶ
 
@@ -70,21 +80,21 @@ skip して `SET` だけ流す)。
 
 ### 出力 SQL の方言
 
-- 識別子: `"schema"."table"`、`"col"`(double-quote)
-- 文字列: SQL 標準クォート二重化(`'O''Brien'`)
-- bytea: PG リテラル `'\x48656c6c6f'`
-- 各データファイル(SQL モード)の先頭に preamble:
-  ```sql
-  SET standard_conforming_strings = on;
-  SET client_encoding = 'UTF8';
-  SET search_path = pg_catalog;
-  ```
-- **重要**: この SQL モード出力は PG 専用(同じ PG クラスタへの round-trip
-  検証用)。MySQL/TiDB に取り込もうとすると `Unknown system variable
-  'standard_conforming_strings'` で弾かれる。
-- Phase 2 では SQL 互換出力は追わず、**CSV を中間フォーマット**として整備し、
-  TiDB Lightning 等のローダ経由で TiDB / MySQL へ流す。Parquet は上流 dumpling
-  にも無いため Phase 3 以降で要否を再検討。
+`--target` フラグで切替(デフォルト `mysql`):
+
+| | `--target=mysql` / `tidb`(デフォルト) | `--target=pg` |
+|---|---|---|
+| 識別子 | `` `schema`.`table` ``、`` `col` `` | `"schema"."table"`、`"col"` |
+| 文字列 | `'O''Brien'`(`NO_BACKSLASH_ESCAPES` 有効化で SQL 標準) | `'O''Brien'` |
+| bytea | `X'48656C6C6F'`(MySQL hex literal) | `'\x48656c6c6f'`(PG hex literal) |
+| Preamble | `SET NAMES utf8mb4; FOREIGN_KEY_CHECKS=0; UNIQUE_CHECKS=0; sql_mode='NO_BACKSLASH_ESCAPES'` | `SET standard_conforming_strings = on; client_encoding = 'UTF8'; search_path = pg_catalog;` |
+| timestamptz / interval / array / inet / json | server-side cast(`pgMigrationCast`)で MySQL 互換テキスト化 | PG ネイティブ表現のまま |
+| `<schema>-schema-create.sql` | `` CREATE DATABASE IF NOT EXISTS `name` `` | `CREATE SCHEMA IF NOT EXISTS "name"` |
+
+CSV モードは `--target` の影響を受けない(常に MySQL/TiDB 互換)。
+
+`<table>-schema.sql` の DDL は引き続き **PG ネイティブ**(`pg_dump --schema-only`
+の出力)。MySQL/TiDB に取り込むときはユーザ側で別途変換すること(LLM 等で)。
 
 ### Postgres と MySQL の型ギャップ
 
@@ -151,15 +161,31 @@ Phase 1 末で完全削除:
   - 削除: `br/pkg/version`、`pkg/util/promutil`、`br/pkg/utils.WithRetry`
     (inline)、`br/pkg/summary`(zap log 化)、`pkg/util` の TLS(stdlib 化)
   - vendor: `pkg/util/table-filter` を `internal/table-filter/` に
-  - 残置: `br/pkg/storage`(クラウドバックエンド一式は dumpling の魅力なので温存。
-    Phase 3 で public TiDB commit pin に切替予定)
+  - 残置: `br/pkg/storage`(クラウドバックエンド一式は dumpling の魅力なので温存)
 
-## Phase 3 候補
+## Phase 3 完了内容(v0.6.0)
 
-- **`replace ~/Work/tidb` の完全解消** — `require github.com/pingcap/tidb v0.0.0-<sha>` で公開リポジトリから引く
-- **CI**(GitHub Actions: build + PG smoke + TiDB smoke)
+- **`--target {mysql, tidb, pg}` フラグ追加**(デフォルト `mysql`)。SQL 出力の方言を選択可能に
+- **`SQLDialect` interface**(`export/dialect.go` 新設):pg / mysql 実装を分離。識別子クォート、preamble、bytea リテラル、CREATE DATABASE/SCHEMA、migration cast の有無を吸収
+- **`pgMigrationCast` を SQL モードでも有効化**(`--target=mysql/tidb` のとき)。bytea は SQL モードでは encode せず、SQLTypeBytes が `X'…'` 形式で出力
+- **`tableMeta.selectColumns` 新設**: SELECT 式と INSERT カラムリストを分離。INSERT には dialect-quoted のカラム名のみ出る
+- **e2e 検証**: `postgres:17` から dump → `mysql:8.4` と `tidb:v8.5.6` で `mysql -h … < dump.sql` 直叩きが成功。21 型 allty テーブル、bytea(NULL バイト含む)、interval、JSON 配列など全て一致
+
+## Phase 3a 完了内容(v0.5.0)
+
+- **`replace ~/Work/tidb` 撤去**: `github.com/pingcap/tidb` を public commit pin
+  (`v1.1.0-beta.0.20260413061245-ae18096e0237` = v8.5.6 commit `ae18096e`)
+  に切替。`go.mod` の require 行を pseudo-version に更新し、ローカル
+  チェックアウト依存を完全に解消
+- `pkg/parser` も同様に pseudo-version(`v0.0.0-20260331085336-4e0b702f38a8`)で固定
+- `proxy.golang.org` 経由で透明に解決され、初回 `go mod download` 後はキャッシュから取得
+- `replace` には TiDB 上流由来の非 TiDB 系(`apache/arrow-go`、`go-ldap`、`sourcegraph` 系)のみが残る
+
+## Phase 4 候補
+
+- **CI**(GitHub Actions: build + PG smoke + MySQL/TiDB smoke)
+- **PostGIS / hstore / tsvector** などの特殊型対応(現状 21 型カバー)
 - **Parquet 出力**(上流 dumpling にも無いので必要性次第)
-- **PostGIS / hstore / tsvector** などの特殊型対応
 
 MySQL 互換 SQL 出力モード(`--target=mysql/tidb` フラグ)は **採用しない**。
 

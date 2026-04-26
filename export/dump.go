@@ -312,7 +312,7 @@ func (d *Dumper) dumpDatabases(tctx *tcontext.Context, metaConn *BaseConn, taskC
 
 	for dbName, tables := range allTables {
 		if !conf.NoSchemas {
-			createDatabaseSQL, err := ShowCreateDatabase(tctx, metaConn, dbName)
+			createDatabaseSQL, err := ShowCreateDatabase(tctx, metaConn, dbName, conf.Dialect())
 			if err != nil {
 				return errors.Trace(err)
 			}
@@ -711,7 +711,10 @@ func prepareTableListToDump(tctx *tcontext.Context, conf *Config, db *sql.Conn) 
 
 func dumpTableMeta(tctx *tcontext.Context, conf *Config, conn *BaseConn, db string, table *TableInfo) (TableMeta, error) {
 	tbl := table.Name
-	selectField, selectLen, err := buildSelectField(tctx, conn, db, tbl, conf.CompleteInsert, conf.FileType == "csv")
+	dialect := conf.Dialect()
+	useCasts := dialect.WantMigrationCasts(conf.FileType)
+	csvMode := conf.FileType == "csv"
+	selectField, selectColumns, selectLen, err := buildSelectField(tctx, conn, db, tbl, conf.CompleteInsert, useCasts, csvMode, dialect)
 	if err != nil {
 		return nil, err
 	}
@@ -738,9 +741,10 @@ func dumpTableMeta(tctx *tcontext.Context, conf *Config, conn *BaseConn, db stri
 		table:            tbl,
 		colTypes:         colTypes,
 		selectedField:    selectField,
+		selectColumns:    selectColumns,
 		selectedLen:      selectLen,
 		hasImplicitRowID: hasImplicitRowID,
-		specCmts:         getSpecialComments(),
+		specCmts:         dialect.Preamble(),
 	}
 
 	if conf.NoSchemas {

@@ -180,9 +180,10 @@ func WriteInsert(
 	}
 	wp.currentFileSize += uint64(bf.Len())
 
+	dialect := cfg.Dialect()
 	var (
 		insertStatementPrefix string
-		row                   = MakeRowReceiver(meta.ColumnTypes())
+		row                   = MakeRowReceiver(meta.ColumnTypes(), dialect)
 		counter               uint64
 		lastCounter           uint64
 		escapeBackslash       = cfg.EscapeBackslash
@@ -208,11 +209,12 @@ func WriteInsert(
 	}()
 
 	selectedField := meta.SelectedField()
+	insertColumns := meta.SelectColumns()
 
-	tableQName := pgQuoteQName(meta.DatabaseName(), meta.TableName())
-	if selectedField != "" && selectedField != "*" {
+	tableQName := dialect.QuoteQName(meta.DatabaseName(), meta.TableName())
+	if insertColumns != "" {
 		insertStatementPrefix = fmt.Sprintf("INSERT INTO %s (%s) VALUES\n",
-			tableQName, selectedField)
+			tableQName, insertColumns)
 	} else {
 		insertStatementPrefix = fmt.Sprintf("INSERT INTO %s VALUES\n",
 			tableQName)
@@ -326,8 +328,9 @@ func WriteInsertInCsv(
 		wg.Wait()
 	}()
 
+	dialect := cfg.Dialect()
 	var (
-		row             = MakeRowReceiver(meta.ColumnTypes())
+		row             = MakeRowReceiver(meta.ColumnTypes(), dialect)
 		counter         uint64
 		lastCounter     uint64
 		escapeBackslash = cfg.EscapeBackslash

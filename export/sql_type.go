@@ -10,7 +10,7 @@ import (
 	"strings"
 )
 
-var colTypeRowReceiverMap = map[string]func() RowReceiverStringer{}
+var colTypeRowReceiverMap = map[string]func(SQLDialect) RowReceiverStringer{}
 
 var (
 	nullValue         = "NULL"
@@ -76,22 +76,26 @@ func escapeCSV(s []byte, bf *bytes.Buffer, _ bool, opt *csvOption) {
 }
 
 // SQLTypeStringMaker returns a SQLTypeString
-func SQLTypeStringMaker() RowReceiverStringer {
+func SQLTypeStringMaker(_ SQLDialect) RowReceiverStringer {
 	return &SQLTypeString{}
 }
 
-// SQLTypeBytesMaker returns a SQLTypeBytes
-func SQLTypeBytesMaker() RowReceiverStringer {
-	return &SQLTypeBytes{}
+// SQLTypeBytesMaker returns a SQLTypeBytes bound to the given dialect, so
+// the resulting binary literals match the target system ('\\xHEX' for
+// pg, X'HEX' for mysql/tidb).
+func SQLTypeBytesMaker(d SQLDialect) RowReceiverStringer {
+	return &SQLTypeBytes{dialect: d}
 }
 
 // SQLTypeNumberMaker returns a SQLTypeNumber
-func SQLTypeNumberMaker() RowReceiverStringer {
+func SQLTypeNumberMaker(_ SQLDialect) RowReceiverStringer {
 	return &SQLTypeNumber{}
 }
 
-// MakeRowReceiver constructs RowReceiverArr from column types
-func MakeRowReceiver(colTypes []string) *RowReceiverArr {
+// MakeRowReceiver constructs RowReceiverArr from column types. The dialect
+// is passed to each receiver factory so binary types can render literals
+// in the target-specific form.
+func MakeRowReceiver(colTypes []string, dialect SQLDialect) *RowReceiverArr {
 	rowReceiverArr := make([]RowReceiverStringer, len(colTypes))
 	for i, colTp := range colTypes {
 		recMaker, ok := colTypeRowReceiverMap[colTp]
@@ -101,7 +105,7 @@ func MakeRowReceiver(colTypes []string) *RowReceiverArr {
 		if recMaker == nil {
 			recMaker = SQLTypeStringMaker
 		}
-		rowReceiverArr[i] = recMaker()
+		rowReceiverArr[i] = recMaker(dialect)
 	}
 	return &RowReceiverArr{
 		bound:     false,
@@ -196,19 +200,29 @@ func (s *SQLTypeString) WriteToBufferInCsv(bf *bytes.Buffer, escapeBackslash boo
 	}
 }
 
-// SQLTypeBytes formats binary columns as PostgreSQL '\xHEX' bytea literals.
+// SQLTypeBytes formats binary columns. The exact literal form is chosen by
+// the bound dialect: pg uses '\\xHEX' (PG bytea literal); mysql/tidb use
+// X'HEX' (binary literal).
 type SQLTypeBytes struct {
 	sql.RawBytes
+	dialect SQLDialect
 }
 
 func (s *SQLTypeBytes) BindAddress(arg []any) { arg[0] = &s.RawBytes }
 
 func (s *SQLTypeBytes) WriteToBuffer(bf *bytes.Buffer, _ bool) {
-	if s.RawBytes != nil {
-		fmt.Fprintf(bf, `'\x%x'`, s.RawBytes)
-	} else {
+	if s.RawBytes == nil {
 		bf.WriteString(nullValue)
+		return
 	}
+	if s.dialect != nil {
+		bf.WriteString(s.dialect.BytesLiteral(s.RawBytes))
+		return
+	}
+	// Fallback to legacy PG behavior when no dialect is bound (e.g.,
+	// tests that construct SQLTypeBytes directly without going through
+	// MakeRowReceiver).
+	fmt.Fprintf(bf, `'\x%x'`, s.RawBytes)
 }
 
 func (s *SQLTypeBytes) WriteToBufferInCsv(bf *bytes.Buffer, escapeBackslash bool, opt *csvOption) {

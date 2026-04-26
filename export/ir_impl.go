@@ -258,6 +258,7 @@ type tableMeta struct {
 	table            string
 	colTypes         []*sql.ColumnType
 	selectedField    string
+	selectColumns    string
 	selectedLen      int
 	specCmts         []string
 	showCreateTable  string
@@ -296,6 +297,10 @@ func (tm *tableMeta) ColumnCount() uint {
 
 func (tm *tableMeta) SelectedField() string {
 	return tm.selectedField
+}
+
+func (tm *tableMeta) SelectColumns() string {
+	return tm.selectColumns
 }
 
 func (tm *tableMeta) SelectedLen() int {
@@ -383,18 +388,5 @@ func (*multiQueriesChunk) RawRows() *sql.Rows {
 	return nil
 }
 
-// pgFilePreamble is the SET-block written at the top of every dumpling
-// output file so that the dump is loadable into Postgres without surprises.
-//
-//   - standard_conforming_strings = on: ensures '...' literals don't
-//     interpret backslash escapes (matches our escapeSQL implementation).
-//   - client_encoding = UTF8: matches what the dumper requested.
-//   - search_path = pg_catalog: defends against malicious user-defined
-//     functions/operators shadowing built-ins during reload.
-var pgFilePreamble = []string{
-	"SET standard_conforming_strings = on;",
-	"SET client_encoding = 'UTF8';",
-	"SET search_path = pg_catalog;",
-}
-
-func getSpecialComments() []string { return pgFilePreamble }
+// Preamble (the SET-block at the top of every output file) is now
+// produced by the dialect, see dialect.go.
