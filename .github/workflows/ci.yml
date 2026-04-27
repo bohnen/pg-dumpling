@@ -10,6 +10,13 @@ on:
 permissions:
   contents: read
 
+# Opt every JavaScript action into the Node.js 24 runtime. Node.js 20 will be
+# removed from runners on 2026-09-16; this env var lets us upgrade ahead of
+# the breaking change without waiting for actions/checkout, actions/setup-go,
+# actions/upload-artifact, etc. to bump their advertised runtime.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 jobs:
   build-and-test:
     name: Build & unit tests
