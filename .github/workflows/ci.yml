@@ -212,6 +212,9 @@ jobs:
           psql -h 127.0.0.1 -U postgres -c 'CREATE DATABASE csv_smoke'
           psql -h 127.0.0.1 -U postgres -d csv_smoke -c \
             "CREATE TABLE big(id int primary key, s text); INSERT INTO big SELECT g, 'row '||g FROM generate_series(1,5000) g"
+          # ANALYZE so pg_class.reltuples is populated; otherwise pg-dumpling's
+          # row-count estimate is 0 and chunking falls back to a single file.
+          psql -h 127.0.0.1 -U postgres -d csv_smoke -c 'ANALYZE big'
 
       - name: Dump with filetype=csv
         run: |
@@ -223,7 +226,10 @@ jobs:
       - name: Inspect CSV
         run: |
           ls -la /tmp/csvdump
-          head -3 /tmp/csvdump/public.big.0000000000000.csv
+          # Show the first chunk regardless of naming (9-digit no-chunk vs
+          # 13-digit chunked vs other compression suffixes).
+          first=$(ls /tmp/csvdump/public.big.*.csv | head -1)
+          head -3 "$first"
 
       - name: Enable LOCAL INFILE on MySQL
         run: |
