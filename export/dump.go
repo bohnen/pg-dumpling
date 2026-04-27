@@ -119,11 +119,16 @@ func (d *Dumper) Dump() (dumpErr error) {
 	if err = conCtrl.Setup(tctx); err != nil {
 		return errors.Trace(err)
 	}
+	m.cdcSlot = conf.cdcSlotInfo
 	// To avoid lock is not released
 	defer func() {
-		err = conCtrl.TearDown(tctx)
+		if tdErr := conCtrl.TearDown(tctx); tdErr != nil {
+			tctx.L().Warn("fail to tear down consistency controller", zap.Error(tdErr))
+		}
 		if err != nil {
-			tctx.L().Warn("fail to tear down consistency controller", zap.Error(err))
+			if cleanErr := conCtrl.OnFailure(tctx); cleanErr != nil {
+				tctx.L().Warn("consistency controller cleanup-on-failure error", zap.Error(cleanErr))
+			}
 		}
 	}()
 

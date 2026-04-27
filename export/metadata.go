@@ -16,6 +16,7 @@ type globalMetadata struct {
 	buffer          bytes.Buffer
 	afterConnBuffer bytes.Buffer
 	snapshot        string
+	cdcSlot         *cdcSlotInfo
 
 	storage storage.ExternalStorage
 }
@@ -47,9 +48,18 @@ func (m *globalMetadata) recordFinishTime(t time.Time) {
 	m.buffer.WriteString("Finished dump at: " + t.Format(metadataTimeLayout) + "\n")
 }
 
-// recordGlobalMetaData records server-side global metadata. Currently a
-// no-op for PostgreSQL; a later step will add pg_current_wal_lsn().
+// recordGlobalMetaData records server-side global metadata. When a CDC
+// replication slot was created (--cdc-slot), the slot's identifying info
+// and consistent_point LSN are written here so a CDC consumer such as AWS
+// DMS can resume from exactly the dump's MVCC point.
 func (m *globalMetadata) recordGlobalMetaData(_ *sql.Conn, _ bool) error {
+	if m.cdcSlot == nil {
+		return nil
+	}
+	m.buffer.WriteString("CDC Slot: " + m.cdcSlot.SlotName + "\n")
+	m.buffer.WriteString("CDC Plugin: " + m.cdcSlot.OutputPlugin + "\n")
+	m.buffer.WriteString("CDC Consistent Point: " + m.cdcSlot.ConsistentPoint + "\n")
+	m.buffer.WriteString("CDC Snapshot Name: " + m.cdcSlot.SnapshotName + "\n")
 	return nil
 }
 

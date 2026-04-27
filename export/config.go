@@ -71,6 +71,9 @@ const (
 	flagCompress                 = "compress"
 	flagCsvOutputDialect         = "csv-output-dialect"
 	flagTarget                   = "target"
+	flagCDCSlot                  = "cdc-slot"
+	flagCDCPlugin                = "cdc-plugin"
+	flagCDCCleanupOnFailure      = "cdc-cleanup-on-failure"
 
 	// FlagHelp represents the help flag
 	FlagHelp = "help"
@@ -173,6 +176,16 @@ type Config struct {
 	CsvOutputDialect   CSVDialect
 	Target             SQLTarget
 
+	// CDCSlot, if non-empty, enables CDC bootstrap: pg-dumpling creates a
+	// logical replication slot atomically with the dump's exported snapshot.
+	// AWS DMS (or any logical decoding consumer) can pick up the slot from
+	// CDCSlot's consistent_point and resume CDC from exactly the point the
+	// dump captured.
+	CDCSlot                string
+	CDCPlugin              string
+	CDCCleanupOnFailure    bool
+	cdcSlotInfo            *cdcSlotInfo
+
 	Labels        prometheus.Labels       `json:"-"`
 	PromRegistry  prometheus.Registerer   `json:"-"`
 	ExtStorage    storage.ExternalStorage `json:"-"`
@@ -219,6 +232,8 @@ func DefaultConfig() *Config {
 		PosAfterConnect:          false,
 		CsvOutputDialect:         CSVDialectDefault,
 		Target:                   TargetMySQL,
+		CDCPlugin:                "pgoutput",
+		CDCCleanupOnFailure:      true,
 		SpecifiedTables:          false,
 		PromRegistry:             prometheus.NewRegistry(),
 		TransactionalConsistency: true,
@@ -357,6 +372,9 @@ func (*Config) DefineFlags(flags *pflag.FlagSet) {
 	flags.StringP(flagCompress, "c", "", "Compress output file type, support 'gzip', 'snappy', 'zstd', 'no-compression' now")
 	flags.String(flagCsvOutputDialect, "", "The dialect of output CSV file, support 'snowflake', 'redshift', 'bigquery' now")
 	flags.String(flagTarget, "mysql", "The target SQL dialect for --filetype=sql: 'mysql' (default) / 'tidb' / 'pg' (round-trip to Postgres)")
+	flags.String(flagCDCSlot, "", "When set, create a logical replication slot of this name atomically with the dump's snapshot, so CDC consumers (e.g. AWS DMS) can resume from exactly the point the dump captured")
+	flags.String(flagCDCPlugin, "pgoutput", "Output plugin for --cdc-slot: 'pgoutput' (default) / 'test_decoding' / 'pglogical_output'")
+	flags.Bool(flagCDCCleanupOnFailure, true, "Drop the --cdc-slot replication slot if the dump fails (otherwise the slot remains and accumulates WAL)")
 }
 
 // ParseFromFlags parses dumpling's export.Config from flags
@@ -601,6 +619,27 @@ func (conf *Config) ParseFromFlags(flags *pflag.FlagSet) error {
 	conf.Target, err = ParseSQLTarget(target)
 	if err != nil {
 		return errors.Trace(err)
+	}
+
+	conf.CDCSlot, err = flags.GetString(flagCDCSlot)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	conf.CDCPlugin, err = flags.GetString(flagCDCPlugin)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	conf.CDCCleanupOnFailure, err = flags.GetBool(flagCDCCleanupOnFailure)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	if conf.CDCSlot != "" {
+		if err = ValidateCDCName("--cdc-slot", conf.CDCSlot); err != nil {
+			return errors.Trace(err)
+		}
+		if err = ValidateCDCName("--cdc-plugin", conf.CDCPlugin); err != nil {
+			return errors.Trace(err)
+		}
 	}
 
 	for k, v := range params {

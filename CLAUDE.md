@@ -23,6 +23,7 @@ TiDB のデータ移行ツール**として使えるようにすること。
 | `v0.5.0` | ✅ | Phase 3a: `replace ~/Work/tidb` 撤去。`github.com/pingcap/tidb` を public commit pin(`v1.1.0-beta.0.20260413061245-ae18096e0237` = v8.5.6)に切替 |
 | `v0.6.0` | ✅ | Phase 3: SQL 出力を MySQL/TiDB 向けに修正。`--target {mysql,tidb,pg}` を追加、デフォルト `mysql`。MySQL/TiDB 直叩きルート(`mysql -h … < dump.sql`)が確立 |
 | `v0.7.0` | ✅ | Phase 4a: PG 追加型 11 種(bit/varbit、geometric 7 種、hstore、composite フォールスルー)。総カバー 35+ 型 |
+| `v0.8.0` | ✅ | Phase 4b: CDC ブートストラップ。`--cdc-slot/--cdc-plugin/--cdc-cleanup-on-failure` で論理レプリケーションスロットを atomic 作成、metadata に LSN 記録、AWS DMS 連携可能 |
 
 ## ビルド & テスト
 
@@ -182,6 +183,23 @@ Phase 1 末で完全削除:
 - `proxy.golang.org` 経由で透明に解決され、初回 `go mod download` 後はキャッシュから取得
 - `replace` には TiDB 上流由来の非 TiDB 系(`apache/arrow-go`、`go-ldap`、`sourcegraph` 系)のみが残る
 
+## Phase 4b 完了内容(v0.8.0)
+
+- **CDC ブートストラップ**: `--cdc-slot <name>` で論理レプリケーションスロットを
+  ダンプの MVCC スナップショットと **atomic に**作成
+  (`CREATE_REPLICATION_SLOT … LOGICAL <plugin> EXPORT_SNAPSHOT`)
+- 対応プラグイン: `pgoutput`(default)、`test_decoding`、`pglogical_output`
+- `metadata` ファイルに `CDC Slot` / `CDC Plugin` / `CDC Consistent Point (LSN)` /
+  `CDC Snapshot Name` を出力
+- `--cdc-cleanup-on-failure`(default ON): ダンプ失敗時にスロットを drop し、
+  WAL を蓄積する事故を防止
+- 識別子バリデーション: replication プロトコルが quoted identifier を受け付け
+  ないため、slot/plugin 名は `[a-z0-9_]{1,63}` に制限
+- AWS DMS 連携: source endpoint の `pluginName` / `slotName` extra connection
+  attributes に metadata の値を渡し、CDC-only タスクとして起動
+- **前提**: PG 側で `wal_level=logical`、RDS なら `rds.logical_replication=1`
+- 詳細・運用注意: `worklog/08-phase4b-cdc-bootstrap.md`
+
 ## Phase 4a 完了内容(v0.7.0)
 
 - **bit / bit varying**: `(col)::text` で文字列リテラル化(`'10101010'`)
@@ -195,7 +213,7 @@ Phase 1 末で完全削除:
 
 ## Phase 4 残候補
 
-- **CI**(GitHub Actions: build + PG smoke + MySQL/TiDB smoke)
+- **CI**(GitHub Actions: build + PG smoke + MySQL/TiDB smoke + CDC smoke)
 - **PostGIS** `geometry`/`geography`(WKT/WKB の選択、SRID 扱い、外部依存)
 - **Parquet 出力**(上流 dumpling にも無いので必要性次第)
 

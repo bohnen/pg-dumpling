@@ -38,6 +38,14 @@ Status
   directly via `mysql -h … < dump.sql` against MySQL 8.4 / TiDB v8.5.6.
   Use `--target=pg` for the legacy PG round-trip behavior. See
   `worklog/06-phase3-mysql-sql.md`.
+- **Phase 4b** (`v0.8.0`) — CDC bootstrap for AWS DMS / logical
+  decoding. `--cdc-slot <name>` atomically creates a logical
+  replication slot (`pgoutput` / `test_decoding` /
+  `pglogical_output`) via `CREATE_REPLICATION_SLOT … EXPORT_SNAPSHOT`,
+  ties it to the dump's MVCC snapshot, and writes the slot name +
+  consistent_point LSN to the `metadata` file so a CDC consumer can
+  resume from exactly the dump's point. See
+  `worklog/08-phase4b-cdc-bootstrap.md`.
 
 What gets dumped
 ----------------
@@ -146,6 +154,11 @@ Flag highlights
    --filetype       sql | csv
    --target         mysql | tidb | pg   (SQL-output dialect, default mysql)
    --consistency    auto | snapshot | none
+   --cdc-slot       create a logical replication slot atomically with the
+                    snapshot (for AWS DMS / pg_recvlogical to resume CDC)
+   --cdc-plugin     pgoutput | test_decoding | pglogical_output (default pgoutput)
+   --cdc-cleanup-on-failure
+                    drop the slot if the dump fails (default true)
    --snapshot       reuse a pg_export_snapshot() token
 -f --filter         table filter glob, e.g. "public.*" or "!pg_catalog.*"
    --no-schemas     skip emitting -schema.sql files
