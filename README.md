@@ -104,6 +104,12 @@ make build
 ./bin/pg-dumpling --help
 ```
 
+Pre-built binaries are also attached to each [GitHub
+Release](https://github.com/bohnen/pg-dumpling/releases) as
+`pg-dumpling-vX.Y.Z-linux-amd64` / `…-linux-arm64` (raw binary, tar.gz,
+and sha256). They are static (`CGO_ENABLED=0`) so they run on any glibc-
+or musl-based Linux distro.
+
 Quick start
 -----------
 

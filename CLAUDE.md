@@ -26,6 +26,7 @@ TiDB のデータ移行ツール**として使えるようにすること。
 | `v0.8.0` | ✅ | Phase 4b: CDC ブートストラップ。`--cdc-slot/--cdc-plugin/--cdc-cleanup-on-failure` で論理レプリケーションスロットを atomic 作成、metadata に LSN 記録、AWS DMS 連携可能 |
 | `v0.9.0` | ✅ | Phase 4c: `--no-preamble` フラグ追加。`--target=tidb` ではデフォルト ON で TiDB Lightning に直接食わせられる SQL を出力 |
 | `v0.10.0` | ✅ | Phase 4d: GitHub Actions CI 導入。build + unit tests + PG/MySQL e2e (SQL/CSV) + CDC bootstrap smoke の 4 ジョブ |
+| `v0.11.0` | ✅ | Phase 4e: タグ push で linux/amd64 + linux/arm64 のリリースバイナリを GitHub Release に自動添付 |
 
 ## ビルド & テスト
 
@@ -217,6 +218,18 @@ Phase 1 末で完全削除:
 - **composite types**: `::text` フォールスルー(PG タプル形式 `(a,b,c)` を文字列化)
 - e2e 検証: `postgres:17` ↔ `mysql:8.4` ↔ PG round-trip で 11 型 + 既存 21 型混在を確認
 - 詳細: `worklog/07-phase4a-additional-types.md`
+
+## Phase 4e 完了内容(v0.11.0)
+
+- **リリースバイナリ自動配布**: タグ `v*` を push すると GitHub Release が自動作成され、
+  `pg-dumpling-vX.Y.Z-linux-amd64` / `…-linux-arm64`(裸バイナリ + tar.gz + sha256)
+  がアセットとして添付される
+- `release` ジョブを `.github/workflows/ci.yml` に追加。matrix で 2 アーキ並列ビルド
+- `CGO_ENABLED=0` で static linked、PG クライアントライブラリ等を含まないため
+  Linux 任意ディストロで動作
+- リリース通知は `softprops/action-gh-release@v2` の `generate_release_notes: true`
+  で commit log から自動生成
+- 詳細: `worklog/11-phase4e-release-binaries.md`
 
 ## Phase 4d 完了内容(v0.10.0)
 
