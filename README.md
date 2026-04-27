@@ -46,6 +46,12 @@ Status
   consistent_point LSN to the `metadata` file so a CDC consumer can
   resume from exactly the dump's point. See
   `worklog/08-phase4b-cdc-bootstrap.md`.
+- **Phase 4c** (`v0.9.0`) — `--no-preamble` flag. SQL output files
+  normally start with a SET-block (`SET sql_mode='NO_BACKSLASH_ESCAPES'`
+  etc.) so they can be loaded directly via `mysql -h … <`. TiDB
+  Lightning rejects bare SET statements, so `--target=tidb` now
+  defaults to no-preamble. Override either way with `--no-preamble`
+  / `--no-preamble=false`.
 
 What gets dumped
 ----------------
@@ -153,6 +159,8 @@ Flag highlights
 -t --threads        worker count
    --filetype       sql | csv
    --target         mysql | tidb | pg   (SQL-output dialect, default mysql)
+   --no-preamble    suppress the SET-block at the top of SQL files
+                    (default ON for --target=tidb, OFF otherwise)
    --consistency    auto | snapshot | none
    --cdc-slot       create a logical replication slot atomically with the
                     snapshot (for AWS DMS / pg_recvlogical to resume CDC)

@@ -749,7 +749,7 @@ func dumpTableMeta(tctx *tcontext.Context, conf *Config, conn *BaseConn, db stri
 		selectColumns:    selectColumns,
 		selectedLen:      selectLen,
 		hasImplicitRowID: hasImplicitRowID,
-		specCmts:         dialect.Preamble(),
+		specCmts:         conf.EffectivePreamble(),
 	}
 
 	if conf.NoSchemas {

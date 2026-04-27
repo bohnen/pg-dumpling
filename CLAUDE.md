@@ -24,6 +24,7 @@ TiDB のデータ移行ツール**として使えるようにすること。
 | `v0.6.0` | ✅ | Phase 3: SQL 出力を MySQL/TiDB 向けに修正。`--target {mysql,tidb,pg}` を追加、デフォルト `mysql`。MySQL/TiDB 直叩きルート(`mysql -h … < dump.sql`)が確立 |
 | `v0.7.0` | ✅ | Phase 4a: PG 追加型 11 種(bit/varbit、geometric 7 種、hstore、composite フォールスルー)。総カバー 35+ 型 |
 | `v0.8.0` | ✅ | Phase 4b: CDC ブートストラップ。`--cdc-slot/--cdc-plugin/--cdc-cleanup-on-failure` で論理レプリケーションスロットを atomic 作成、metadata に LSN 記録、AWS DMS 連携可能 |
+| `v0.9.0` | ✅ | Phase 4c: `--no-preamble` フラグ追加。`--target=tidb` ではデフォルト ON で TiDB Lightning に直接食わせられる SQL を出力 |
 
 ## ビルド & テスト
 
@@ -84,16 +85,21 @@ skip して `SET` だけ流す)。
 
 `--target` フラグで切替(デフォルト `mysql`):
 
-| | `--target=mysql` / `tidb`(デフォルト) | `--target=pg` |
-|---|---|---|
-| 識別子 | `` `schema`.`table` ``、`` `col` `` | `"schema"."table"`、`"col"` |
-| 文字列 | `'O''Brien'`(`NO_BACKSLASH_ESCAPES` 有効化で SQL 標準) | `'O''Brien'` |
-| bytea | `X'48656C6C6F'`(MySQL hex literal) | `'\x48656c6c6f'`(PG hex literal) |
-| Preamble | `SET NAMES utf8mb4; FOREIGN_KEY_CHECKS=0; UNIQUE_CHECKS=0; sql_mode='NO_BACKSLASH_ESCAPES'` | `SET standard_conforming_strings = on; client_encoding = 'UTF8'; search_path = pg_catalog;` |
-| timestamptz / interval / array / inet / json | server-side cast(`pgMigrationCast`)で MySQL 互換テキスト化 | PG ネイティブ表現のまま |
-| `<schema>-schema-create.sql` | `` CREATE DATABASE IF NOT EXISTS `name` `` | `CREATE SCHEMA IF NOT EXISTS "name"` |
+| | `--target=mysql`(デフォルト) | `--target=tidb` | `--target=pg` |
+|---|---|---|---|
+| 識別子 | `` `schema`.`table` ``、`` `col` `` | 同左 | `"schema"."table"`、`"col"` |
+| 文字列 | `'O''Brien'`(`NO_BACKSLASH_ESCAPES` 有効化で SQL 標準) | `'O''Brien'`(同左、Lightning パーサが SQL 標準として解釈) | `'O''Brien'` |
+| bytea | `X'48656C6C6F'`(MySQL hex literal) | 同左 | `'\x48656c6c6f'`(PG hex literal) |
+| Preamble | `SET NAMES utf8mb4; FOREIGN_KEY_CHECKS=0; UNIQUE_CHECKS=0; sql_mode='NO_BACKSLASH_ESCAPES'` | **なし**(`--no-preamble` がデフォルト ON。Lightning が裸の SET を弾くため) | `SET standard_conforming_strings = on; client_encoding = 'UTF8'; search_path = pg_catalog;` |
+| timestamptz / interval / array / inet / json | server-side cast で MySQL 互換テキスト化 | 同左 | PG ネイティブ表現のまま |
+| `<schema>-schema-create.sql` | `` /*!… SET … */; CREATE DATABASE IF NOT EXISTS `name` `` | `` CREATE DATABASE IF NOT EXISTS `name` ``(preamble なし) | `CREATE SCHEMA IF NOT EXISTS "name"` |
+| 主な用途 | `mysql -h … < dump.sql` 直叩き | TiDB Lightning(`tidb-lightning -d /tmp/dump`) | PG round-trip 検証 |
 
-CSV モードは `--target` の影響を受けない(常に MySQL/TiDB 互換)。
+`--no-preamble` フラグで上書き可能:
+- `--target=tidb --no-preamble=false`: preamble 復活(ad-hoc に `mysql -h tidb:4000 < dump.sql` したい場合)
+- `--target=mysql --no-preamble`: preamble 抑制(Lightning に MySQL flavor で食わせたい等の特殊ケース)
+
+CSV モードは `--target` / `--no-preamble` の影響を受けない(常に MySQL/TiDB 互換、preamble なし)。
 
 `<table>-schema.sql` の DDL は引き続き **PG ネイティブ**(`pg_dump --schema-only`
 の出力)。MySQL/TiDB に取り込むときはユーザ側で別途変換すること(LLM 等で)。

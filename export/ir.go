@@ -86,7 +86,7 @@ type MetaIR interface {
 	MetaSQL() string
 }
 
-func setTableMetaFromRows(rows *sql.Rows, dialect SQLDialect) (TableMeta, error) {
+func setTableMetaFromRows(rows *sql.Rows, conf *Config) (TableMeta, error) {
 	tps, err := rows.ColumnTypes()
 	if err != nil {
 		return nil, errors.Trace(err)
@@ -95,6 +95,7 @@ func setTableMetaFromRows(rows *sql.Rows, dialect SQLDialect) (TableMeta, error)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
+	dialect := conf.Dialect()
 	exprs := make([]string, len(nms))
 	cols := make([]string, len(nms))
 	for i, n := range nms {
@@ -106,6 +107,6 @@ func setTableMetaFromRows(rows *sql.Rows, dialect SQLDialect) (TableMeta, error)
 		selectedField: strings.Join(exprs, ","),
 		selectColumns: strings.Join(cols, ","),
 		selectedLen:   len(nms),
-		specCmts:      dialect.Preamble(),
+		specCmts:      conf.EffectivePreamble(),
 	}, nil
 }

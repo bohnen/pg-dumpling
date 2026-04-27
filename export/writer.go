@@ -214,7 +214,7 @@ func (w *Writer) WriteTableData(meta TableMeta, ir TableDataIR, currentChunk int
 		}
 		if conf.SQL != "" {
 			rows := ir.RawRows()
-			meta, err = setTableMetaFromRows(rows, conf.Dialect())
+			meta, err = setTableMetaFromRows(rows, conf)
 			if err != nil {
 				return err
 			}
@@ -285,7 +285,7 @@ func (w *Writer) writeMetaToFile(tctx *tcontext.Context, target, metaSQL string,
 	err = WriteMeta(tctx, &metaData{
 		target:   target,
 		metaSQL:  metaSQL,
-		specCmts: w.conf.Dialect().Preamble(),
+		specCmts: w.conf.EffectivePreamble(),
 	}, fileWriter)
 	tearDownErr := tearDown(tctx)
 	if err == nil {

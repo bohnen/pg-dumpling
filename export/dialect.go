@@ -105,6 +105,16 @@ func DialectFor(t SQLTarget) SQLDialect {
 // Dialect returns the SQLDialect for this Config's target.
 func (conf *Config) Dialect() SQLDialect { return DialectFor(conf.Target) }
 
+// EffectivePreamble returns the SET-block written at the top of SQL output
+// files. When --no-preamble was set (explicitly or as the target-aware
+// default for tidb), this returns nil so callers emit nothing.
+func (conf *Config) EffectivePreamble() []string {
+	if conf.NoPreamble {
+		return nil
+	}
+	return conf.Dialect().Preamble()
+}
+
 // pgDialect emits the historical PG-native SQL output. This is what every
 // data file produced before v0.6.0 looked like, so we keep it 1:1 with the
 // previous pgQuoteIdent / pgFilePreamble / SQLTypeBytes behavior.

@@ -74,6 +74,7 @@ const (
 	flagCDCSlot                  = "cdc-slot"
 	flagCDCPlugin                = "cdc-plugin"
 	flagCDCCleanupOnFailure      = "cdc-cleanup-on-failure"
+	flagNoPreamble               = "no-preamble"
 
 	// FlagHelp represents the help flag
 	FlagHelp = "help"
@@ -185,6 +186,14 @@ type Config struct {
 	CDCPlugin              string
 	CDCCleanupOnFailure    bool
 	cdcSlotInfo            *cdcSlotInfo
+
+	// NoPreamble suppresses the SET-block at the top of every SQL output
+	// file (data files and schema files). Useful for TiDB Lightning, which
+	// rejects bare SET statements in data files. Default is target-aware:
+	//   --target=tidb            → true  (Lightning is the default workflow)
+	//   --target=mysql / pg      → false (mysql -h … < dump.sql wants the SETs)
+	// Override either way with --no-preamble or --no-preamble=false.
+	NoPreamble bool
 
 	Labels        prometheus.Labels       `json:"-"`
 	PromRegistry  prometheus.Registerer   `json:"-"`
@@ -375,6 +384,7 @@ func (*Config) DefineFlags(flags *pflag.FlagSet) {
 	flags.String(flagCDCSlot, "", "When set, create a logical replication slot of this name atomically with the dump's snapshot, so CDC consumers (e.g. AWS DMS) can resume from exactly the point the dump captured")
 	flags.String(flagCDCPlugin, "pgoutput", "Output plugin for --cdc-slot: 'pgoutput' (default) / 'test_decoding' / 'pglogical_output'")
 	flags.Bool(flagCDCCleanupOnFailure, true, "Drop the --cdc-slot replication slot if the dump fails (otherwise the slot remains and accumulates WAL)")
+	flags.Bool(flagNoPreamble, false, "Suppress the SET-block at the top of SQL output files (default: ON for --target=tidb, OFF otherwise). Required for TiDB Lightning, which rejects bare SET statements")
 }
 
 // ParseFromFlags parses dumpling's export.Config from flags
@@ -640,6 +650,18 @@ func (conf *Config) ParseFromFlags(flags *pflag.FlagSet) error {
 		if err = ValidateCDCName("--cdc-plugin", conf.CDCPlugin); err != nil {
 			return errors.Trace(err)
 		}
+	}
+
+	conf.NoPreamble, err = flags.GetBool(flagNoPreamble)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	// Target-aware default: --target=tidb implies Lightning workflow, which
+	// rejects bare SET statements. Apply only when the user did not pass
+	// --no-preamble explicitly, so an explicit --no-preamble=false still
+	// wins.
+	if !flags.Changed(flagNoPreamble) && conf.Target == TargetTiDB {
+		conf.NoPreamble = true
 	}
 
 	for k, v := range params {
