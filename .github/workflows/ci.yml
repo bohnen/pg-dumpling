@@ -395,11 +395,14 @@ jobs:
           ls -la dist
 
       - name: Upload to GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             dist/pg-dumpling-${{ github.ref_name }}-linux-${{ matrix.goarch }}
             dist/pg-dumpling-${{ github.ref_name }}-linux-${{ matrix.goarch }}.tar.gz
             dist/pg-dumpling-${{ github.ref_name }}-linux-${{ matrix.goarch }}.sha256
           fail_on_unmatched_files: true
-          generate_release_notes: true
+          # Only the amd64 matrix run generates the release body, otherwise
+          # both runs append release notes and we get duplicate
+          # "Full Changelog" lines. arm64 just uploads the additional files.
+          generate_release_notes: ${{ matrix.goarch == 'amd64' }}
