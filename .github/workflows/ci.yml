@@ -10,22 +10,15 @@ on:
 permissions:
   contents: read
 
-# Opt every JavaScript action into the Node.js 24 runtime. Node.js 20 will be
-# removed from runners on 2026-09-16; this env var lets us upgrade ahead of
-# the breaking change without waiting for actions/checkout, actions/setup-go,
-# actions/upload-artifact, etc. to bump their advertised runtime.
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-
 jobs:
   build-and-test:
     name: Build & unit tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           cache: true
@@ -43,7 +36,7 @@ jobs:
         run: make test-unit
 
       - name: Upload binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: pg-dumpling-linux-amd64
           path: bin/pg-dumpling
@@ -77,10 +70,10 @@ jobs:
           --health-timeout 3s
           --health-retries 24
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           cache: true
@@ -192,10 +185,10 @@ jobs:
           --health-timeout 3s
           --health-retries 24
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           cache: true
@@ -265,10 +258,10 @@ jobs:
     name: E2E - CDC slot bootstrap
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           cache: true
