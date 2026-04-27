@@ -1,6 +1,10 @@
 pg-dumpling
 ===========
 
+[![CI](https://github.com/bohnen/pg-dumpling/actions/workflows/ci.yml/badge.svg)](https://github.com/bohnen/pg-dumpling/actions/workflows/ci.yml)
+
+
+
 `pg-dumpling` is a PostgreSQL data dump tool that emits the
 [dumpling](https://github.com/pingcap/tidb/tree/master/dumpling) directory
 format. It is designed as a building block for **PostgreSQL → MySQL / TiDB

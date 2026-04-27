@@ -25,6 +25,7 @@ TiDB のデータ移行ツール**として使えるようにすること。
 | `v0.7.0` | ✅ | Phase 4a: PG 追加型 11 種(bit/varbit、geometric 7 種、hstore、composite フォールスルー)。総カバー 35+ 型 |
 | `v0.8.0` | ✅ | Phase 4b: CDC ブートストラップ。`--cdc-slot/--cdc-plugin/--cdc-cleanup-on-failure` で論理レプリケーションスロットを atomic 作成、metadata に LSN 記録、AWS DMS 連携可能 |
 | `v0.9.0` | ✅ | Phase 4c: `--no-preamble` フラグ追加。`--target=tidb` ではデフォルト ON で TiDB Lightning に直接食わせられる SQL を出力 |
+| `v0.10.0` | ✅ | Phase 4d: GitHub Actions CI 導入。build + unit tests + PG/MySQL e2e (SQL/CSV) + CDC bootstrap smoke の 4 ジョブ |
 
 ## ビルド & テスト
 
@@ -217,11 +218,21 @@ Phase 1 末で完全削除:
 - e2e 検証: `postgres:17` ↔ `mysql:8.4` ↔ PG round-trip で 11 型 + 既存 21 型混在を確認
 - 詳細: `worklog/07-phase4a-additional-types.md`
 
+## Phase 4d 完了内容(v0.10.0)
+
+- **GitHub Actions CI** 導入(`.github/workflows/ci.yml`)
+- 4 ジョブ: build-and-test / e2e-mysql / e2e-csv / e2e-cdc
+- 検証範囲: 件数、bytea(`HEX()` 比較)、JSON 抽出、quote-doubling、5000 行 CSV chunked、CDC slot LSN 一致、cleanup-on-failure
+- postgres:17 + mysql:8.4 を service container として並列起動(壁時計 ~3 min)
+- CDC ジョブのみ `wal_level=logical` 必要なため `docker run` で直接起動
+- PGDG apt repo から postgresql-client-17 を install(pg_dump version 整合のため)
+- 詳細: `worklog/10-phase4d-ci.md`
+
 ## Phase 4 残候補
 
-- **CI**(GitHub Actions: build + PG smoke + MySQL/TiDB smoke + CDC smoke)
 - **PostGIS** `geometry`/`geography`(WKT/WKB の選択、SRID 扱い、外部依存)
 - **Parquet 出力**(上流 dumpling にも無いので必要性次第)
+- **TiDB e2e** ジョブの追加(現状 MySQL 8.4 のみ。差分があれば後付け)
 
 MySQL 互換 SQL 出力モード(`--target=mysql/tidb` フラグ)は **採用しない**。
 

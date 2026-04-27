@@ -1,0 +1,345 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: Build & unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: go vet
+        run: make vet
+
+      - name: Build
+        run: make build
+
+      - name: Verify binary
+        run: ./bin/pg-dumpling --version
+
+      - name: Unit tests
+        run: make test-unit
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: pg-dumpling-linux-amd64
+          path: bin/pg-dumpling
+          retention-days: 14
+          if-no-files-found: error
+
+  e2e-mysql:
+    name: E2E - PG to MySQL SQL roundtrip
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: secret
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 12
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: secret
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -uroot -psecret"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 24
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install postgresql-client-17 (PGDG)
+        run: |
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl --fail -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          sudo sh -c 'echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends postgresql-client-17 mysql-client
+
+      - name: Build
+        run: make build
+
+      - name: Seed PG
+        env:
+          PGPASSWORD: secret
+        run: |
+          psql -h 127.0.0.1 -U postgres -c 'CREATE DATABASE smoke'
+          psql -h 127.0.0.1 -U postgres -d smoke <<'SQL'
+          CREATE TABLE allty (
+            id     serial PRIMARY KEY,
+            s      text,
+            i      int,
+            b      bytea,
+            ts_tz  timestamptz,
+            j      jsonb,
+            arr    int[]
+          );
+          INSERT INTO allty (s, i, b, ts_tz, j, arr) VALUES
+            ('hello', 42, E'\\x48656c6c6f00ff',
+             '2026-01-15 10:30:45.123456+00',
+             '{"k":"v","n":[1,2]}',
+             ARRAY[1,2,3]),
+            ('O''Brien', NULL, NULL, NULL, NULL, NULL);
+          SQL
+
+      - name: Dump with target=mysql
+        run: |
+          ./bin/pg-dumpling \
+            -h 127.0.0.1 -P 5432 -u postgres -p secret \
+            -B smoke -o /tmp/dump --threads 2 \
+            --filetype sql --target mysql
+
+      - name: Inspect dump
+        run: |
+          ls -la /tmp/dump
+          echo '---'
+          head -10 /tmp/dump/public.allty.000000000.sql
+
+      - name: Prepare MySQL DDL (hand-translated)
+        run: |
+          mysql -h 127.0.0.1 -uroot -psecret <<'SQL'
+          CREATE DATABASE IF NOT EXISTS `public`;
+          USE `public`;
+          CREATE TABLE `allty` (
+            id    int PRIMARY KEY AUTO_INCREMENT,
+            s     text,
+            i     int,
+            b     varbinary(255),
+            ts_tz datetime(6),
+            j     json,
+            arr   json
+          );
+          SQL
+
+      - name: Load dump into MySQL
+        run: |
+          mysql -h 127.0.0.1 -uroot -psecret < /tmp/dump/public.allty.000000000.sql
+
+      - name: Verify rows + bytea + JSON + quote-doubling
+        run: |
+          ROWS=$(mysql -h 127.0.0.1 -uroot -psecret -N -e "SELECT count(*) FROM public.allty")
+          test "$ROWS" = "2" || { echo "expected 2 rows, got $ROWS"; exit 1; }
+          BHEX=$(mysql -h 127.0.0.1 -uroot -psecret -N -e "SELECT HEX(b) FROM public.allty WHERE id=1")
+          test "$BHEX" = "48656C6C6F00FF" || { echo "bytea mismatch: $BHEX"; exit 1; }
+          JK=$(mysql -h 127.0.0.1 -uroot -psecret -N -e "SELECT JSON_EXTRACT(j, '\$.k') FROM public.allty WHERE id=1")
+          test "$JK" = '"v"' || { echo "json mismatch: $JK"; exit 1; }
+          OB=$(mysql -h 127.0.0.1 -uroot -psecret -N -e "SELECT s FROM public.allty WHERE id=2")
+          test "$OB" = "O'Brien" || { echo "quote-doubling failed: $OB"; exit 1; }
+          echo "all assertions passed"
+
+  e2e-csv:
+    name: E2E - PG to CSV via LOAD DATA
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: secret
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 12
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: secret
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -uroot -psecret"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 24
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install clients
+        run: |
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl --fail -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          sudo sh -c 'echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends postgresql-client-17 mysql-client
+
+      - name: Build
+        run: make build
+
+      - name: Seed PG
+        env:
+          PGPASSWORD: secret
+        run: |
+          psql -h 127.0.0.1 -U postgres -c 'CREATE DATABASE csv_smoke'
+          psql -h 127.0.0.1 -U postgres -d csv_smoke -c \
+            "CREATE TABLE big(id int primary key, s text); INSERT INTO big SELECT g, 'row '||g FROM generate_series(1,5000) g"
+
+      - name: Dump with filetype=csv
+        run: |
+          ./bin/pg-dumpling \
+            -h 127.0.0.1 -P 5432 -u postgres -p secret \
+            -B csv_smoke -o /tmp/csvdump --threads 2 \
+            --filetype csv --rows 1000
+
+      - name: Inspect CSV
+        run: |
+          ls -la /tmp/csvdump
+          head -3 /tmp/csvdump/public.big.0000000000000.csv
+
+      - name: Enable LOCAL INFILE on MySQL
+        run: |
+          mysql -h 127.0.0.1 -uroot -psecret -e "SET GLOBAL local_infile=ON"
+
+      - name: Prepare MySQL and load CSV
+        run: |
+          mysql -h 127.0.0.1 -uroot -psecret <<'SQL'
+          CREATE DATABASE IF NOT EXISTS `public`;
+          CREATE TABLE `public`.`big` (id int PRIMARY KEY, s varchar(64));
+          SQL
+          for f in /tmp/csvdump/public.big.*.csv; do
+            mysql -h 127.0.0.1 -uroot -psecret --local-infile=1 \
+              -e "LOAD DATA LOCAL INFILE '$f' INTO TABLE public.big \
+                  FIELDS TERMINATED BY ',' ENCLOSED BY '\"' \
+                  LINES TERMINATED BY '\r\n' IGNORE 1 LINES"
+          done
+
+      - name: Verify CSV row count
+        run: |
+          ROWS=$(mysql -h 127.0.0.1 -uroot -psecret -N -e "SELECT count(*) FROM public.big")
+          test "$ROWS" = "5000" || { echo "expected 5000, got $ROWS"; exit 1; }
+          echo "CSV roundtrip passed ($ROWS rows)"
+
+  e2e-cdc:
+    name: E2E - CDC slot bootstrap
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install postgresql-client-17 (PGDG)
+        run: |
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl --fail -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          sudo sh -c 'echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends postgresql-client-17
+
+      - name: Start PG with wal_level=logical
+        run: |
+          docker run --rm -d --name pg-cdc \
+            -e POSTGRES_PASSWORD=secret \
+            -p 5432:5432 \
+            postgres:17 -c wal_level=logical
+          for i in $(seq 1 30); do
+            if PGPASSWORD=secret psql -h 127.0.0.1 -U postgres -c 'SELECT 1' >/dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Build
+        run: make build
+
+      - name: Seed
+        env:
+          PGPASSWORD: secret
+        run: |
+          psql -h 127.0.0.1 -U postgres -c 'CREATE DATABASE cdc_smoke'
+          psql -h 127.0.0.1 -U postgres -d cdc_smoke -c \
+            "CREATE TABLE t(id int primary key, s text); INSERT INTO t VALUES (1,'hello'),(2,'world')"
+
+      - name: Dump with cdc-slot (success path)
+        run: |
+          ./bin/pg-dumpling \
+            -h 127.0.0.1 -P 5432 -u postgres -p secret \
+            -B cdc_smoke -o /tmp/dump-cdc --threads 1 \
+            --filetype sql --target tidb \
+            --cdc-slot ci_smoke_slot --cdc-plugin pgoutput
+
+      - name: Verify metadata file
+        run: |
+          cat /tmp/dump-cdc/metadata
+          grep -q "^CDC Slot: ci_smoke_slot$" /tmp/dump-cdc/metadata
+          grep -q "^CDC Plugin: pgoutput$" /tmp/dump-cdc/metadata
+          grep -qE "^CDC Consistent Point: [0-9A-Fa-f]+/[0-9A-Fa-f]+$" /tmp/dump-cdc/metadata
+          grep -qE "^CDC Snapshot Name: " /tmp/dump-cdc/metadata
+
+      - name: Verify slot LSN matches metadata
+        env:
+          PGPASSWORD: secret
+        run: |
+          SLOT_LSN=$(psql -h 127.0.0.1 -U postgres -d cdc_smoke -t -A \
+            -c "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name='ci_smoke_slot'")
+          META_LSN=$(grep "^CDC Consistent Point:" /tmp/dump-cdc/metadata | awk '{print $4}')
+          test -n "$SLOT_LSN" || { echo "slot not found"; exit 1; }
+          test "$SLOT_LSN" = "$META_LSN" || { echo "LSN mismatch slot=$SLOT_LSN meta=$META_LSN"; exit 1; }
+          echo "slot LSN matches metadata: $SLOT_LSN"
+
+      - name: Verify cleanup-on-failure
+        env:
+          PGPASSWORD: secret
+        run: |
+          mkdir -p /tmp/dump-fail && chmod 555 /tmp/dump-fail
+          set +e
+          ./bin/pg-dumpling \
+            -h 127.0.0.1 -P 5432 -u postgres -p secret \
+            -B cdc_smoke -o /tmp/dump-fail --threads 1 \
+            --filetype sql --target tidb \
+            --cdc-slot ci_cleanup_slot --cdc-plugin pgoutput
+          RC=$?
+          set -e
+          chmod 755 /tmp/dump-fail
+          test "$RC" -ne 0 || { echo "expected dump to fail"; exit 1; }
+          COUNT=$(psql -h 127.0.0.1 -U postgres -t -A \
+            -c "SELECT count(*) FROM pg_replication_slots WHERE slot_name='ci_cleanup_slot'")
+          test "$COUNT" = "0" || { echo "slot was not cleaned up (count=$COUNT)"; exit 1; }
+          echo "cleanup-on-failure dropped the slot"
+
+      - name: Tear down PG container
+        if: always()
+        run: docker stop pg-cdc || true
