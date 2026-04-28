@@ -254,6 +254,129 @@ jobs:
           test "$ROWS" = "5000" || { echo "expected 5000, got $ROWS"; exit 1; }
           echo "CSV roundtrip passed ($ROWS rows)"
 
+  e2e-tidb:
+    name: E2E - PG to TiDB SQL roundtrip
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: secret
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 12
+      # pingcap/tidb v8.x ships a single-binary "standalone" mode that
+      # listens on :4000 over the MySQL wire protocol — no PD/TiKV
+      # sidecars required, so we can use it as a plain service container.
+      # The image has no health-check tool inside, so we poll readiness
+      # from the runner with mysql-client below.
+      tidb:
+        image: pingcap/tidb:v8.5.6
+        ports:
+          - 4000:4000
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install clients
+        run: |
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl --fail -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          sudo sh -c 'echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends postgresql-client-17 mysql-client
+
+      - name: Wait for TiDB
+        run: |
+          for i in $(seq 1 60); do
+            if mysql -h 127.0.0.1 -P 4000 -u root -e 'SELECT 1' >/dev/null 2>&1; then
+              echo "TiDB ready"; break
+            fi
+            sleep 2
+          done
+          mysql -h 127.0.0.1 -P 4000 -u root -e 'SELECT version()'
+
+      - name: Build
+        run: make build
+
+      - name: Seed PG
+        env:
+          PGPASSWORD: secret
+        run: |
+          psql -h 127.0.0.1 -U postgres -c 'CREATE DATABASE smoke'
+          psql -h 127.0.0.1 -U postgres -d smoke <<'SQL'
+          CREATE TABLE allty (
+            id     serial PRIMARY KEY,
+            s      text,
+            i      int,
+            b      bytea,
+            ts_tz  timestamptz,
+            j      jsonb,
+            arr    int[]
+          );
+          INSERT INTO allty (s, i, b, ts_tz, j, arr) VALUES
+            ('hello', 42, E'\\x48656c6c6f00ff',
+             '2026-01-15 10:30:45.123456+00',
+             '{"k":"v","n":[1,2]}',
+             ARRAY[1,2,3]),
+            ('O''Brien', NULL, NULL, NULL, NULL, NULL);
+          SQL
+
+      - name: Dump with target=tidb
+        run: |
+          ./bin/pg-dumpling \
+            -h 127.0.0.1 -P 5432 -u postgres -p secret \
+            -B smoke -o /tmp/dump --threads 2 \
+            --filetype sql --target tidb
+
+      - name: Inspect dump
+        run: |
+          ls -la /tmp/dump
+          echo '---'
+          head -5 /tmp/dump/public.allty.000000000.sql
+
+      - name: Prepare TiDB DDL (hand-translated)
+        run: |
+          mysql -h 127.0.0.1 -P 4000 -u root <<'SQL'
+          CREATE DATABASE IF NOT EXISTS `public`;
+          USE `public`;
+          CREATE TABLE `allty` (
+            id    int PRIMARY KEY AUTO_INCREMENT,
+            s     text,
+            i     int,
+            b     varbinary(255),
+            ts_tz datetime(6),
+            j     json,
+            arr   json
+          );
+          SQL
+
+      - name: Load dump into TiDB
+        run: |
+          mysql -h 127.0.0.1 -P 4000 -u root < /tmp/dump/public.allty.000000000.sql
+
+      - name: Verify rows + bytea + JSON + quote-doubling
+        run: |
+          ROWS=$(mysql -h 127.0.0.1 -P 4000 -u root -N -e "SELECT count(*) FROM public.allty")
+          test "$ROWS" = "2" || { echo "expected 2 rows, got $ROWS"; exit 1; }
+          BHEX=$(mysql -h 127.0.0.1 -P 4000 -u root -N -e "SELECT HEX(b) FROM public.allty WHERE id=1")
+          test "$BHEX" = "48656C6C6F00FF" || { echo "bytea mismatch: $BHEX"; exit 1; }
+          JK=$(mysql -h 127.0.0.1 -P 4000 -u root -N -e "SELECT JSON_EXTRACT(j, '\$.k') FROM public.allty WHERE id=1")
+          test "$JK" = '"v"' || { echo "json mismatch: $JK"; exit 1; }
+          OB=$(mysql -h 127.0.0.1 -P 4000 -u root -N -e "SELECT s FROM public.allty WHERE id=2")
+          test "$OB" = "O'Brien" || { echo "quote-doubling failed: $OB"; exit 1; }
+          echo "all assertions passed against TiDB v8.5.6"
+
   e2e-cdc:
     name: E2E - CDC slot bootstrap
     runs-on: ubuntu-latest

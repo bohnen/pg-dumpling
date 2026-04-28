@@ -246,9 +246,6 @@ Phase 1 末で完全削除:
 
 - **PostGIS** `geometry`/`geography`(WKT/WKB の選択、SRID 扱い、外部依存)
 - **Parquet 出力**(上流 dumpling にも無いので必要性次第)
-- **TiDB e2e** ジョブの追加(現状 MySQL 8.4 のみ。差分があれば後付け)
-
-MySQL 互換 SQL 出力モード(`--target=mysql/tidb` フラグ)は **採用しない**。
 
 ## 作業のお作法
 
