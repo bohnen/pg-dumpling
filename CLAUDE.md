@@ -27,6 +27,7 @@ TiDB のデータ移行ツール**として使えるようにすること。
 | `v0.9.0` | ✅ | Phase 4c: `--no-preamble` フラグ追加。`--target=tidb` ではデフォルト ON で TiDB Lightning に直接食わせられる SQL を出力 |
 | `v0.10.0` | ✅ | Phase 4d: GitHub Actions CI 導入。build + unit tests + PG/MySQL e2e (SQL/CSV) + CDC bootstrap smoke の 4 ジョブ |
 | `v0.11.0` | ✅ | Phase 4e: タグ push で linux/amd64 + linux/arm64 のリリースバイナリを GitHub Release に自動添付 |
+| `v0.12.0` | ✅ | Phase 4f: リリース matrix に darwin/arm64 を追加(Apple Silicon)。macOS は native runner でビルド(`gosigar` の CGO 必須のため) |
 
 ## ビルド & テスト
 

@@ -351,16 +351,23 @@ jobs:
         run: docker stop pg-cdc || true
 
   release:
-    name: Release linux/${{ matrix.goarch }} binary
+    name: Release ${{ matrix.goos }}/${{ matrix.goarch }} binary
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [build-and-test, e2e-mysql, e2e-csv, e2e-cdc]
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runs-on }}
     permissions:
       contents: write
     strategy:
       fail-fast: false
       matrix:
-        goarch: [amd64, arm64]
+        # Linux: cross-compile statically on Ubuntu (CGO disabled).
+        # darwin/arm64: native build on a macOS runner because
+        # github.com/cloudfoundry/gosigar (transitive via tikv/pd client)
+        # has darwin sources that require CGO.
+        include:
+          - { goos: linux,  goarch: amd64, runs-on: ubuntu-latest }
+          - { goos: linux,  goarch: arm64, runs-on: ubuntu-latest }
+          - { goos: darwin, goarch: arm64, runs-on: macos-latest }
     steps:
       - uses: actions/checkout@v6
 
@@ -370,39 +377,42 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Cross-compile pg-dumpling
+      - name: Build pg-dumpling
         env:
-          GOOS: linux
+          GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
-          CGO_ENABLED: "0"
+          # darwin keeps CGO on (gosigar darwin impl needs it; macOS runner
+          # has the toolchain). linux stays static.
+          CGO_ENABLED: ${{ matrix.goos == 'darwin' && '1' || '0' }}
         run: |
           make build
           file bin/pg-dumpling
 
       - name: Stage release asset
         env:
+          OS: ${{ matrix.goos }}
           ARCH: ${{ matrix.goarch }}
           TAG: ${{ github.ref_name }}
         run: |
           mkdir -p dist
-          BIN_NAME="pg-dumpling-${TAG}-linux-${ARCH}"
+          BIN_NAME="pg-dumpling-${TAG}-${OS}-${ARCH}"
           cp bin/pg-dumpling "dist/${BIN_NAME}"
           chmod +x "dist/${BIN_NAME}"
-          # Also pack a tar.gz for users who prefer downloading an archive
           tar -czvf "dist/${BIN_NAME}.tar.gz" -C dist "${BIN_NAME}"
-          # Generate sha256 alongside, useful for `wget … | sha256sum -c`
-          ( cd dist && sha256sum "${BIN_NAME}" "${BIN_NAME}.tar.gz" > "${BIN_NAME}.sha256" )
+          # macOS uses BSD shasum; Linux ubuntu-latest has both shasum and
+          # sha256sum. Use shasum for cross-platform compatibility.
+          ( cd dist && shasum -a 256 "${BIN_NAME}" "${BIN_NAME}.tar.gz" > "${BIN_NAME}.sha256" )
           ls -la dist
 
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v3
         with:
           files: |
-            dist/pg-dumpling-${{ github.ref_name }}-linux-${{ matrix.goarch }}
-            dist/pg-dumpling-${{ github.ref_name }}-linux-${{ matrix.goarch }}.tar.gz
-            dist/pg-dumpling-${{ github.ref_name }}-linux-${{ matrix.goarch }}.sha256
+            dist/pg-dumpling-${{ github.ref_name }}-${{ matrix.goos }}-${{ matrix.goarch }}
+            dist/pg-dumpling-${{ github.ref_name }}-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz
+            dist/pg-dumpling-${{ github.ref_name }}-${{ matrix.goos }}-${{ matrix.goarch }}.sha256
           fail_on_unmatched_files: true
-          # Only the amd64 matrix run generates the release body, otherwise
-          # both runs append release notes and we get duplicate
-          # "Full Changelog" lines. arm64 just uploads the additional files.
-          generate_release_notes: ${{ matrix.goarch == 'amd64' }}
+          # Only the linux/amd64 matrix run owns the release body. The other
+          # runs upload their files without regenerating the changelog so we
+          # don't get duplicate "Full Changelog" lines.
+          generate_release_notes: ${{ matrix.goos == 'linux' && matrix.goarch == 'amd64' }}

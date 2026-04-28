@@ -104,11 +104,28 @@ make build
 ./bin/pg-dumpling --help
 ```
 
-Pre-built binaries are also attached to each [GitHub
-Release](https://github.com/bohnen/pg-dumpling/releases) as
-`pg-dumpling-vX.Y.Z-linux-amd64` / `…-linux-arm64` (raw binary, tar.gz,
-and sha256). They are static (`CGO_ENABLED=0`) so they run on any glibc-
-or musl-based Linux distro.
+Pre-built binaries are attached to each [GitHub
+Release](https://github.com/bohnen/pg-dumpling/releases) (raw binary,
+`tar.gz`, and `sha256` checksum):
+
+  - `pg-dumpling-vX.Y.Z-linux-amd64`
+  - `pg-dumpling-vX.Y.Z-linux-arm64`
+  - `pg-dumpling-vX.Y.Z-darwin-arm64` (Apple Silicon)
+
+Linux binaries are static (`CGO_ENABLED=0`) so they run on any glibc- or
+musl-based distro. The macOS binary is a native ARM64 build and is **not
+notarized**; if you download via Safari/Finder, Gatekeeper will quarantine
+it. Either remove the quarantine flag or use `curl` (which doesn't set
+the attribute):
+
+```sh
+# Option 1: clear the quarantine flag on a Safari-downloaded file
+xattr -d com.apple.quarantine pg-dumpling-vX.Y.Z-darwin-arm64
+
+# Option 2: download via curl (no quarantine attribute)
+curl -LO https://github.com/bohnen/pg-dumpling/releases/download/vX.Y.Z/pg-dumpling-vX.Y.Z-darwin-arm64
+chmod +x pg-dumpling-vX.Y.Z-darwin-arm64
+```
 
 Quick start
 -----------
