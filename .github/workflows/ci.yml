@@ -530,6 +530,12 @@ jobs:
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v3
         with:
+          # Keep the release in draft state across all matrix runs. GitHub now
+          # makes published releases immutable, so once any matrix job flips
+          # the release to published the others fail with "tag_name was used
+          # by an immutable release". The publish-release job below flips it
+          # to published after every matrix job has uploaded.
+          draft: true
           files: |
             dist/pg-dumpling-${{ github.ref_name }}-${{ matrix.goos }}-${{ matrix.goarch }}
             dist/pg-dumpling-${{ github.ref_name }}-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz
@@ -539,3 +545,20 @@ jobs:
           # runs upload their files without regenerating the changelog so we
           # don't get duplicate "Full Changelog" lines.
           generate_release_notes: ${{ matrix.goos == 'linux' && matrix.goarch == 'amd64' }}
+
+  publish-release:
+    name: Publish release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Flip draft release to published
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release edit "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --draft=false \
+            --latest
